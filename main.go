@@ -1,16 +1,17 @@
 package main
 
 import (
-	"flag"          // Package for parsing command-line flags
-	"fmt"           // Package for formatted I/O
-	"log"           // Package for logging
-	"os"            // Package for operating system functionality
-	"path/filepath" // Package for file path manipulation
-	"strings"       // Package for string manipulation
-	"sync"          // Package for concurrency synchronization
-	"time"          // Package for time-related functionality
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
-	"github.com/trendmicro/tm-v1-fs-golang-sdk/client" // Importing Trend Micro's Vision One File Scanner SDK
+	"github.com/trendmicro/tm-v1-fs-golang-sdk/client"
 )
 
 // Constants and Types
@@ -35,24 +36,24 @@ func (tags *Tags) Set(value string) error {
 
 // Variables
 var (
-	apiKey       = flag.String("apiKey", "", "Vision One API Key")                 // API Key flag
-	region       = flag.String("region", "us-east-1", "Vision One Region")         // Region flag
-	directory    = flag.String("directory", "", "Path to Directory to scan")       // Directory flag
-	verbose      = flag.Bool("verbose", false, "Log all scans to stdout")          // Verbose flag
-	maxWorkers   = flag.Int("maxWorkers", 10, "Max number of workers. Minimum: 2") // Max workers flag
-	totalScanned = 0                                                               // Counter for total files scanned
-	waitGroup    sync.WaitGroup                                                    // WaitGroup for synchronization
-	tags         Tags                                                              // Tags for file scanning
+	apiKey         = flag.String("apiKey", "", "Vision One API Key")
+	region         = flag.String("region", "us-east-1", "Vision One Region")
+	directory      = flag.String("directory", "", "Path to Directory to scan")
+	verbose        = flag.Bool("verbose", false, "Log all scans to stdout")
+	maxScanWorkers = flag.Int("maxWorkers", -1, "Max number concurrent file scans. Default: Unlimited")
+
+	totalScanned int64          // Counter for total files scanned, ensure thread-safe operations
+	waitGroup    sync.WaitGroup // WaitGroup for synchronization
+	tags         Tags           // Tags for file scanning
 )
 
-// Main function
 func main() {
 	// Parse command-line flags
 	flag.Var(&tags, "tags", "Up to 8 strings separated by commas")
 	flag.Parse()
 
 	// Check for required arguments
-	if *apiKey == "" || *directory == "" || *maxWorkers < 2 {
+	if *apiKey == "" || *directory == "" {
 		flag.PrintDefaults()
 		log.Fatal("Missing required arguments")
 	}
@@ -75,14 +76,18 @@ func main() {
 	}
 	defer client.Destroy()
 
-	// Initialize channel for concurrency control
-	scanChannel := make(chan struct{}, *maxWorkers)
+	// Initialize channel for file scan concurrency control with an appropriate limit
+	scanFileChannel := make(chan struct{}, func() int {
+		if *maxScanWorkers == -1 {
+			return 1000 // practically "unlimited" value
+		}
+		return *maxScanWorkers
+	}())
 
 	// Start scanning the initial directory
 	startTime := time.Now()
-	scanChannel <- struct{}{} // Add coroutine into channel
 	waitGroup.Add(1)
-	scanDirectory(scanChannel, client, *directory)
+	go scanDirectory(client, *directory, scanFileChannel)
 
 	// Wait for all goroutines to finish before exiting
 	waitGroup.Wait()
@@ -97,79 +102,61 @@ func main() {
 	}
 	defer func() {
 		scanLog.Close()
-		close(scanChannel)
+		close(scanFileChannel) // Close the channel
 	}()
 
 	// Write scan statistics to log file
-	fmt.Fprintf(scanLog, "Total Scan Time: %s\nTotal Files Scanned: %d", timeTaken, totalScanned)
+	fmt.Fprintf(scanLog, "Total Scan Time: %s\nTotal Files Scanned: %d\n", timeTaken, atomic.LoadInt64(&totalScanned))
 }
 
 // Function to recursively scan a directory
-func scanDirectory(channel chan struct{}, client *client.AmaasClient, directory string) error {
-	defer func() {
-		waitGroup.Done()
-		<-channel
-	}()
+func scanDirectory(client *client.AmaasClient, directory string, scanFileChannel chan struct{}) {
+	defer waitGroup.Done()
 
 	// Read directory contents
 	files, err := os.ReadDir(directory)
 	if err != nil {
-		if *verbose {
-			fmt.Printf("Error reading directory: %v", err)
-		}
-		log.Printf("Error reading directory: %v", err)
-		return err
+		log.Printf("Error reading directory: %v\n", err)
+		return
 	}
 
-	// Iterate through directory contents
 	for _, f := range files {
 		fp := filepath.Join(directory, f.Name())
 		if f.IsDir() {
-			channel <- struct{}{}
 			waitGroup.Add(1)
-			go scanDirectory(channel, client, fp) // Recursive call for subdirectories
+			go scanDirectory(client, fp, scanFileChannel) // Recursive call for subdirectories
 		} else {
-			// Check file size
 			fileInfo, err := f.Info()
-			if err != nil {
-				log.Printf("Error getting file info: %v", err)
-				continue
+			if err != nil || fileInfo.Size() > oneGB {
+				continue // Skip if error or file size exceeds 1GB
 			}
-			fileSize := fileInfo.Size()
-			if fileSize > oneGB {
-				log.Printf("Error: File %s size exceeds 1GB", fp)
-				continue
-			}
-			err = scanFile(client, fp) // Scan individual file
-			if err != nil {
-				if *verbose {
-					fmt.Printf("Error scanning file: %s", f.Name())
+			waitGroup.Add(1)
+			go func(filePath string) {
+				scanFileChannel <- struct{}{} // Control concurrency
+				if err := scanFile(client, filePath); err != nil {
+					log.Printf("Error scanning file: %v\n", err)
 				}
-				log.Printf("Error scanning file: %s", f.Name())
-			}
+				<-scanFileChannel
+				waitGroup.Done()
+			}(fp)
 		}
 	}
-	return nil
 }
 
 // Function to scan an individual file
 func scanFile(client *client.AmaasClient, filePath string) error {
-	// Remove after testing
 	start := time.Now()
 	defer func() {
-		totalScanned++
+		atomic.AddInt64(&totalScanned, 1) // Thread-safe increment
 		if *verbose {
-			fmt.Println(time.Since(start))
+			fmt.Printf("Scanned: %s, Duration: %s\n", filePath, time.Since(start))
 		}
 	}()
 
 	// Call Vision One SDK to scan the file
 	result, err := client.ScanFile(filePath, tags)
-	if err != nil {
-		return err
-	}
-	if *verbose {
+	if *verbose && err == nil {
 		fmt.Println(result)
 	}
-	return nil
+	return err
 }
