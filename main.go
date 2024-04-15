@@ -43,6 +43,15 @@ var (
 	tags         Tags           // Tags for file scanning
 )
 
+func testAuth(client *client.AmaasClient) error {
+	_, err := client.ScanBuffer([]byte(""), "testAuth", nil)
+	if err != nil {
+		return err
+	} else {
+		return nil
+	}
+}
+
 func main() {
 	// Parse command-line flags
 	flag.Var(&tags, "tags", "Up to 8 strings separated by commas")
@@ -72,6 +81,13 @@ func main() {
 	client, err := client.NewClient(v1ApiKey, *region) //This is not creating an error with bad key
 	if err != nil {
 		log.Fatalf("Error creating client: %v", err)
+	}
+
+	authTest := testAuth(client)
+
+	if authTest != nil {
+		fmt.Println("Bad Credentials. Check API KEY and role permissions")
+		os.Exit(1)
 	}
 
 	defer client.Destroy()
