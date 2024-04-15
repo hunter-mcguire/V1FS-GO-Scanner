@@ -14,18 +14,14 @@ import (
 	"github.com/trendmicro/tm-v1-fs-golang-sdk/client"
 )
 
-// Constants and Types
-const oneGB = 1 << 30 // Constant representing 1GB in bytes
-
-// Tags represents a slice of strings used for tagging files during scanning
 type Tags []string
 
-// String returns the string representation of Tags
+// returns the string representation of Tags
 func (tags *Tags) String() string {
 	return fmt.Sprintf("%v", *tags)
 }
 
-// Set sets the value of Tags
+// set the value of Tags
 func (tags *Tags) Set(value string) error {
 	*tags = append(*tags, strings.Split(value, ",")...)
 	if len(*tags) > 8 {
@@ -36,11 +32,11 @@ func (tags *Tags) Set(value string) error {
 
 // Variables
 var (
-	apiKey         = flag.String("apiKey", "", "Vision One API Key")
+	apiKey         = flag.String("apiKey", "", "Vision One API Key. Can also use V1_FS_KEY env var")
 	region         = flag.String("region", "us-east-1", "Vision One Region")
 	directory      = flag.String("directory", "", "Path to Directory to scan")
 	verbose        = flag.Bool("verbose", false, "Log all scans to stdout")
-	maxScanWorkers = flag.Int("maxWorkers", -1, "Max number concurrent file scans. Default: Unlimited")
+	maxScanWorkers = flag.Int("maxWorkers", 100, "Max number concurrent file scans Unlimited: -1")
 
 	totalScanned int64          // Counter for total files scanned, ensure thread-safe operations
 	waitGroup    sync.WaitGroup // WaitGroup for synchronization
@@ -52,11 +48,33 @@ func main() {
 	flag.Var(&tags, "tags", "Up to 8 strings separated by commas")
 	flag.Parse()
 
+	var v1ApiKey string
+
 	// Check for required arguments
-	if *apiKey == "" || *directory == "" {
-		flag.PrintDefaults()
-		log.Fatal("Missing required arguments")
+	k, e := os.LookupEnv("V1_FS_KEY")
+	if e {
+		v1ApiKey = k
+	} else {
+		if *apiKey == "" {
+			flag.PrintDefaults()
+			log.Fatal("Use V1_FS_KEY env var or -apiKey parameter")
+		} else {
+			v1ApiKey = *apiKey
+		}
 	}
+
+	if *directory == "" {
+		flag.PrintDefaults()
+		log.Fatal("Missing required argument: -directory")
+	}
+
+	// Create Vision One client
+	client, err := client.NewClient(v1ApiKey, *region) //This is not creating an error with bad key
+	if err != nil {
+		log.Fatalf("Error creating client: %v", err)
+	}
+
+	defer client.Destroy()
 
 	// Initialize logging
 	timestamp := time.Now().Format("01-02-2006T15:04")
@@ -69,20 +87,16 @@ func main() {
 	log.SetOutput(logFile)
 	log.SetFlags(log.Lshortfile | log.LstdFlags)
 
-	// Create Vision One client
-	client, err := client.NewClient(*apiKey, *region)
-	if err != nil {
-		log.Fatalf("Error creating client: %v", err)
-	}
-	defer client.Destroy()
-
 	// Initialize channel for file scan concurrency control with an appropriate limit
-	scanFileChannel := make(chan struct{}, func() int {
+	var scanFileChannel chan struct{}
+
+	func() {
 		if *maxScanWorkers == -1 {
-			return 1000 // practically "unlimited" value
+			scanFileChannel = make(chan struct{})
+		} else {
+			scanFileChannel = make(chan struct{}, *maxScanWorkers)
 		}
-		return *maxScanWorkers
-	}())
+	}()
 
 	// Start scanning the initial directory
 	startTime := time.Now()
@@ -126,10 +140,6 @@ func scanDirectory(client *client.AmaasClient, directory string, scanFileChannel
 			waitGroup.Add(1)
 			go scanDirectory(client, fp, scanFileChannel) // Recursive call for subdirectories
 		} else {
-			fileInfo, err := f.Info()
-			if err != nil || fileInfo.Size() > oneGB {
-				continue // Skip if error or file size exceeds 1GB
-			}
 			waitGroup.Add(1)
 			go func(filePath string) {
 				scanFileChannel <- struct{}{} // Control concurrency
