@@ -11,8 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/trendmicro/tm-v1-fs-golang-sdk/client"
+	amaasclient "github.com/trendmicro/tm-v1-fs-golang-sdk"
 )
+
+//function to build the config file, then when calling main ask items missing
 
 type Tags []string
 
@@ -36,6 +38,8 @@ var (
 	region         = flag.String("region", "us-east-1", "Vision One Region")
 	directory      = flag.String("directory", "", "Path to Directory to scan")
 	verbose        = flag.Bool("verbose", false, "Log all scans to stdout")
+	pml            = flag.Bool("pml", false, "enable predictive machine learning detection")
+	feedback       = flag.Bool("feedback", false, "enable SPN feedback")
 	maxScanWorkers = flag.Int("maxWorkers", 100, "Max number concurrent file scans Unlimited: -1")
 
 	totalScanned int64          // Counter for total files scanned, ensure thread-safe operations
@@ -43,7 +47,7 @@ var (
 	tags         Tags           // Tags for file scanning
 )
 
-func testAuth(client *client.AmaasClient) error {
+func testAuth(client *amaasclient.AmaasClient) error {
 	_, err := client.ScanBuffer([]byte(""), "testAuth", nil)
 	if err != nil {
 		return err
@@ -78,9 +82,17 @@ func main() {
 	}
 
 	// Create Vision One client
-	client, err := client.NewClient(v1ApiKey, *region) //This is not creating an error with bad key
+	client, err := amaasclient.NewClient(v1ApiKey, *region) //This is not creating an error with bad key
 	if err != nil {
 		log.Fatalf("Error creating client: %v", err)
+	}
+
+	if *pml {
+		client.SetPMLEnable()
+	}
+
+	if *feedback {
+		client.SetFeedbackEnable()
 	}
 
 	authTest := testAuth(client)
@@ -140,7 +152,7 @@ func main() {
 }
 
 // Function to recursively scan a directory
-func scanDirectory(client *client.AmaasClient, directory string, scanFileChannel chan struct{}) {
+func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileChannel chan struct{}) {
 	defer waitGroup.Done()
 
 	// Read directory contents
@@ -170,7 +182,7 @@ func scanDirectory(client *client.AmaasClient, directory string, scanFileChannel
 }
 
 // Function to scan an individual file
-func scanFile(client *client.AmaasClient, filePath string) error {
+func scanFile(client *amaasclient.AmaasClient, filePath string) error {
 	start := time.Now()
 	defer func() {
 		atomic.AddInt64(&totalScanned, 1) // Thread-safe increment
