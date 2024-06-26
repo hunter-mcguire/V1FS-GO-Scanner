@@ -11,7 +11,7 @@
 -region | *string* | Vision One Region. Default: "us-east-1" 
 -tags | *string(comma-seperated)* | Up to 8 strings separated by commas. Default: ""
 -pml | *bool* | Enable predictive machine learning detection. Default: false
--spn_feedback | *bool* | Enable Smart Protection Network feedback. Default: false
+-feedback | *bool* | Enable Smart Protection Network feedback. Default: false
 -verbose | *bool* | Logs all scans to stdout. Default: false
 
 <br>
