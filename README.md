@@ -1,5 +1,5 @@
 # V1FS-GO-Scanner
-### The scanner is a Golang binary, which is used as a command line program. Below are the following paramaters allowed for usage in the program.
+### The scanner is a Go binary designed to function as a command-line program. It takes a directory file path as input to perform a recursive scan of all items in the root directory. The program accepts the following parameters:
 <br>
 <br>
 
