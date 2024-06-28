@@ -1,6 +1,7 @@
-# V1FS-GO-Scanner
+# Vision One File Security Go Scanner
 ### The scanner is a Go binary designed to function as a command-line program. It takes a directory file path as input to perform a recursive scan of all items in the root directory. The program accepts the following parameters:
 <br>
+Link to Github SDK Repo: https://github.com/trendmicro/tm-v1-fs-golang-sdk
 <br>
 
 | Paramater| Type | Description |
