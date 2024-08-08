@@ -34,17 +34,20 @@ func (tags *Tags) Set(value string) error {
 
 // Variables
 var (
-	apiKey         = flag.String("apiKey", "", "Vision One API Key. Can also use V1_FS_KEY env var")
-	region         = flag.String("region", "us-east-1", "Vision One Region")
-	directory      = flag.String("directory", "", "Path to Directory to scan")
-	verbose        = flag.Bool("verbose", false, "Log all scans to stdout")
-	pml            = flag.Bool("pml", false, "enable predictive machine learning detection")
-	feedback       = flag.Bool("feedback", false, "enable SPN feedback")
-	maxScanWorkers = flag.Int("maxWorkers", 100, "Max number concurrent file scans Unlimited: -1")
+	apiKey           = flag.String("apiKey", "", "Vision One API Key. Can also use V1_FS_KEY env var")
+	region           = flag.String("region", "us-east-1", "Vision One Region")
+	directory        = flag.String("directory", "", "Path to Directory to scan")
+	verbose          = flag.Bool("verbose", false, "Log all scans to stdout")
+	pml              = flag.Bool("pml", false, "enable predictive machine learning detection")
+	feedback         = flag.Bool("feedback", false, "enable SPN feedback")
+	maxScanWorkers   = flag.Int("maxWorkers", 100, "Max number concurrent file scans Unlimited: -1")
+	internal_address = flag.String("internal_address", "", "Internal Service Gateway Address")
+	internal_tls     = flag.Bool("internal_tls", true, "Use TLS for internal Service Gateway")
 
-	totalScanned int64          // Counter for total files scanned, ensure thread-safe operations
-	waitGroup    sync.WaitGroup // WaitGroup for synchronization
-	tags         Tags           // Tags for file scanning
+	totalScanned int64                    // Counter for total files scanned, ensure thread-safe operations
+	waitGroup    sync.WaitGroup           // WaitGroup for synchronization
+	tags         Tags                     // Tags for file scanning
+	client       *amaasclient.AmaasClient // FS Client
 )
 
 func testAuth(client *amaasclient.AmaasClient) error {
@@ -62,6 +65,7 @@ func main() {
 	flag.Parse()
 
 	var v1ApiKey string
+	var err error
 
 	// Check for required arguments
 	k, e := os.LookupEnv("V1_FS_KEY")
@@ -82,9 +86,16 @@ func main() {
 	}
 
 	// Create Vision One client
-	client, err := amaasclient.NewClient(v1ApiKey, *region) //This is not creating an error with bad key
-	if err != nil {
-		log.Fatalf("Error creating client: %v", err)
+	if *internal_addr != "" {
+		client, err = amaasclient.NewClientInternal(v1ApiKey, *internal_addr, *internal_tls)
+		if err != nil {
+			log.Fatalf("Error creating client: %v", err)
+		}
+	} else {
+		client, err = amaasclient.NewClient(v1ApiKey, *region)
+		if err != nil {
+			log.Fatalf("Error creating client: %v", err)
+		}
 	}
 
 	if *pml {
