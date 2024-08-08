@@ -86,8 +86,8 @@ func main() {
 	}
 
 	// Create Vision One client
-	if *internal_addr != "" {
-		client, err = amaasclient.NewClientInternal(v1ApiKey, *internal_addr, *internal_tls)
+	if *internal_address != "" {
+		client, err = amaasclient.NewClientInternal(v1ApiKey, *internal_address, *internal_tls)
 		if err != nil {
 			log.Fatalf("Error creating client: %v", err)
 		}
