@@ -14,7 +14,7 @@ Link to Github SDK Repo: https://github.com/trendmicro/tm-v1-fs-golang-sdk
 -tags | *string(comma-seperated)* | Up to 8 strings separated by commas. Default: ""
 -pml | *bool* | Enable predictive machine learning detection. Default: false
 -feedback | *bool* | Enable Smart Protection Network feedback. Default: false
--internal_address | *string* | Internal Service Gateway Address. ex. 192.168.2.5:443
+-internal_address | *string* | Internal Service Gateway Address.
 -internal_tls | *bool* | Use TLS for internal Service Gateway
 -verbose | *bool* | Logs all scans to stdout. Default: false
 
