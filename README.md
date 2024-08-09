@@ -27,10 +27,18 @@ Link to Github SDK Repo: https://github.com/trendmicro/tm-v1-fs-golang-sdk
 <br>
 
 ### Example Usage: <br><br>
+Usage to cloud based scanner
+
 ```sh
 ./v1_fs_go_scanner -apiKey=<v1_api_key> -directory=/tmp/some_folder -maxWorkers=200 -tags=dev,us-east-1,temp_project -verbose=true
 ```
 <br>
+
+Usage to Service Gateway scanner
+
+```sh
+./v1_fs_go_scanner -apiKey=<v1_api_key> -directory=/tmp/some_folder -maxWorkers=200 -tags=dev,us-east-1,temp_project -verbose=true -internal_address=192.168.2.5:443
+```
 <br>
 
 Additionally, this program will create to two files in the directory from which it is ran.
