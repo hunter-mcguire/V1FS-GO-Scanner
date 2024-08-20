@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -14,8 +15,23 @@ import (
 	amaasclient "github.com/trendmicro/tm-v1-fs-golang-sdk"
 )
 
-// Function to build the config file, then when calling main ask items missing
+// Struct to represent the scan result
+type ScanResult struct {
+	ScannerVersion string `json:"scannerVersion"`
+	SchemaVersion  string `json:"schemaVersion"`
+	ScanResult     int    `json:"scanResult"`
+	ScanId         string `json:"scanId"`
+	ScanTimestamp  string `json:"scanTimestamp"`
+	FileName       string `json:"fileName"`
+	FoundMalwares  []struct {
+		FileName   string `json:"fileName"`
+		MalwareName string `json:"malwareName"`
+	} `json:"foundMalwares"`
+	FileSHA1   string `json:"fileSHA1"`
+	FileSHA256 string `json:"fileSHA256"`
+}
 
+// Function to build the config file, then when calling main ask items missing
 type Tags []string
 
 // Returns the string representation of Tags
@@ -44,12 +60,14 @@ var (
 	internal_address = flag.String("internal_address", "", "Internal Service Gateway Address")
 	internal_tls     = flag.Bool("internal_tls", true, "Use TLS for internal Service Gateway")
 
-	totalScanned int64                    // Counter for total files scanned, ensure thread-safe operations
-	waitGroup    sync.WaitGroup           // WaitGroup for synchronization
-	tags         Tags                     // Tags for file scanning
-	client       *amaasclient.AmaasClient // FS Client
-	scannedFiles []string                 // Slice to store scanned file paths
-	mu           sync.Mutex               // Mutex for thread-safe access to scannedFiles
+	totalScanned    int64                    // Counter for total files scanned, ensure thread-safe operations
+	filesWithMalware int64                   // Counter for files with malware found
+	filesClean      int64                    // Counter for files with no issues
+	waitGroup       sync.WaitGroup           // WaitGroup for synchronization
+	tags            Tags                     // Tags for file scanning
+	client          *amaasclient.AmaasClient // FS Client
+	mu              sync.Mutex               // Mutex for thread-safe access to log file
+	scanLog         *os.File                 // File to log scanned files and results
 )
 
 func testAuth(client *amaasclient.AmaasClient) error {
@@ -128,6 +146,14 @@ func main() {
 	log.SetOutput(logFile)
 	log.SetFlags(log.Lshortfile | log.LstdFlags)
 
+	// Initialize the scan log file
+	scanLogFile := fmt.Sprintf("%s-Scan.log", timestamp)
+	scanLog, err = os.OpenFile(scanLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Error creating scan log file: %v", err)
+	}
+	defer scanLog.Close()
+
 	// Initialize channel for file scan concurrency control with an appropriate limit
 	var scanFileChannel chan struct{}
 
@@ -150,24 +176,17 @@ func main() {
 	// Calculate total scan time
 	timeTaken := time.Since(startTime)
 
-	// Open scan log file
-	scanLog, err := os.OpenFile(timestamp+"-Scan.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatal("Error:", err)
-	}
-	defer func() {
-		scanLog.Close()
-		close(scanFileChannel) // Close the channel
-	}()
+	// Write scan statistics and GRC summary to log file
+	mu.Lock()
+	fmt.Fprintf(scanLog, "Total Scan Time: %s\nTotal Files Scanned: %d\nFiles with Malware: %d\nFiles Clean: %d\n", timeTaken, atomic.LoadInt64(&totalScanned), atomic.LoadInt64(&filesWithMalware), atomic.LoadInt64(&filesClean))
+	mu.Unlock()
 
-	// Write scan statistics to log file
-	fmt.Fprintf(scanLog, "Total Scan Time: %s\nTotal Files Scanned: %d\n", timeTaken, atomic.LoadInt64(&totalScanned))
-
-	// Output the list of scanned files
-	fmt.Println("Files Scanned:")
-	for _, file := range scannedFiles {
-		fmt.Println(file)
-	}
+	// Output the summary to the terminal
+	fmt.Println("\n--- Scan Summary ---")
+	fmt.Printf("Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
+	fmt.Printf("Files with Malware: %d\n", atomic.LoadInt64(&filesWithMalware))
+	fmt.Printf("Files Clean: %d\n", atomic.LoadInt64(&filesClean))
+	fmt.Printf("Total Scan Time: %s\n", timeTaken)
 }
 
 // Function to recursively scan a directory
@@ -206,17 +225,40 @@ func scanFile(client *amaasclient.AmaasClient, filePath string) error {
 	defer func() {
 		atomic.AddInt64(&totalScanned, 1) // Thread-safe increment
 		mu.Lock()
-		scannedFiles = append(scannedFiles, filePath) // Add scanned file path to the list
+		// Log the scanned file path and scan result to the scan log
+		fmt.Fprintf(scanLog, "Scanned: %s, Duration: %s\n", filePath, time.Since(start))
 		mu.Unlock()
-		if *verbose {
-			fmt.Printf("Scanned: %s, Duration: %s\n", filePath, time.Since(start))
-		}
 	}()
 
+	// Output the file being scanned
+	fmt.Printf("Scanning: %s\n", filePath)
+
 	// Call Vision One SDK to scan the file
-	result, err := client.ScanFile(filePath, tags)
-	if *verbose && err == nil {
-		fmt.Println(result)
+	rawResult, err := client.ScanFile(filePath, tags)
+	if err == nil {
+		var result ScanResult
+		err := json.Unmarshal([]byte(rawResult), &result)
+		if err != nil {
+			log.Printf("Error parsing scan result for file %s: %v\n", filePath, err)
+			return err
+		}
+
+		// Analyze the scan result
+		if len(result.FoundMalwares) > 0 {
+			atomic.AddInt64(&filesWithMalware, 1)
+		} else {
+			atomic.AddInt64(&filesClean, 1)
+		}
+
+		// Log the result of the scan in JSON format (for detailed review)
+		mu.Lock()
+		fmt.Fprintf(scanLog, "%s\n", rawResult)
+		mu.Unlock()
 	}
-	return err
+
+	// Print concise output to the terminal
+	if err == nil {
+		fmt.Printf("Scanned: %s [scanned in %s]\n", filePath, time.Since(start))
+	}
+	return err // Return any error encountered during the scan
 }
