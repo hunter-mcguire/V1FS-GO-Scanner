@@ -228,8 +228,21 @@ func scanFile(client *amaasclient.AmaasClient, filePath string) error {
         log.Printf("Error opening file %s: %v\n", filePath, err)
         return err
     }
-    // Close the file immediately after the check
-    file.Close()
+
+    // Get file information to check its type
+    fileInfo, err := file.Stat()
+    file.Close() // Close the file as soon as we're done with it
+
+    if err != nil {
+        log.Printf("Error getting file info for %s: %v\n", filePath, err)
+        return err
+    }
+
+    // Skip special files (e.g., directories, sockets, device files)
+    if fileInfo.Mode().IsDir() || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.Mode()&os.ModeNamedPipe != 0 || fileInfo.Mode()&os.ModeSocket != 0 {
+        log.Printf("Skipping special file %s\n", filePath)
+        return nil
+    }
 
     defer func() {
         atomic.AddInt64(&totalScanned, 1) // Thread-safe increment
