@@ -219,46 +219,56 @@ func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileCh
 	}
 }
 
-// Function to scan an individual file
 func scanFile(client *amaasclient.AmaasClient, filePath string) error {
-	start := time.Now()
-	defer func() {
-		atomic.AddInt64(&totalScanned, 1) // Thread-safe increment
-		mu.Lock()
-		// Log the scanned file path and scan result to the scan log
-		fmt.Fprintf(scanLog, "Scanned: %s, Duration: %s\n", filePath, time.Since(start))
-		mu.Unlock()
-	}()
+    start := time.Now()
 
-	// Output the file being scanned
-	fmt.Printf("Scanning: %s\n", filePath)
+    // Try to open the file to check if it can be accessed
+    file, err := os.Open(filePath)
+    if err != nil {
+        log.Printf("Error opening file %s: %v\n", filePath, err)
+        return err
+    }
+    // Close the file immediately after the check
+    file.Close()
 
-	// Call Vision One SDK to scan the file
-	rawResult, err := client.ScanFile(filePath, tags)
-	if err == nil {
-		var result ScanResult
-		err := json.Unmarshal([]byte(rawResult), &result)
-		if err != nil {
-			log.Printf("Error parsing scan result for file %s: %v\n", filePath, err)
-			return err
-		}
+    defer func() {
+        atomic.AddInt64(&totalScanned, 1) // Thread-safe increment
+        mu.Lock()
+        // Log the scanned file path and scan result to the scan log
+        fmt.Fprintf(scanLog, "Scanned: %s, Duration: %s\n", filePath, time.Since(start))
+        mu.Unlock()
+    }()
 
-		// Analyze the scan result
-		if len(result.FoundMalwares) > 0 {
-			atomic.AddInt64(&filesWithMalware, 1)
-		} else {
-			atomic.AddInt64(&filesClean, 1)
-		}
+    // Output the file being scanned
+    fmt.Printf("Scanning: %s\n", filePath)
 
-		// Log the result of the scan in JSON format (for detailed review)
-		mu.Lock()
-		fmt.Fprintf(scanLog, "%s\n", rawResult)
-		mu.Unlock()
-	}
+    // Call Vision One SDK to scan the file
+    rawResult, err := client.ScanFile(filePath, tags)
+    if err == nil {
+        var result ScanResult
+        err := json.Unmarshal([]byte(rawResult), &result)
+        if err != nil {
+            log.Printf("Error parsing scan result for file %s: %v\n", filePath, err)
+            return err
+        }
 
-	// Print concise output to the terminal
-	if err == nil {
-		fmt.Printf("Scanned: %s [scanned in %s]\n", filePath, time.Since(start))
-	}
-	return err // Return any error encountered during the scan
+        // Analyze the scan result
+        if len(result.FoundMalwares) > 0 {
+            atomic.AddInt64(&filesWithMalware, 1)
+        } else {
+            atomic.AddInt64(&filesClean, 1)
+        }
+
+        // Log the result of the scan in JSON format (for detailed review)
+        mu.Lock()
+        fmt.Fprintf(scanLog, "%s\n", rawResult)
+        mu.Unlock()
+    }
+
+    // Print concise output to the terminal
+    if err == nil {
+        fmt.Printf("Scanned: %s [scanned in %s]\n", filePath, time.Since(start))
+    }
+
+    return err
 }
