@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -59,7 +60,9 @@ var (
 	maxScanWorkers   = flag.Int("maxWorkers", 100, "Max number concurrent file scans Unlimited: -1")
 	internal_address = flag.String("internal_address", "", "Internal Service Gateway Address")
 	internal_tls     = flag.Bool("internal_tls", true, "Use TLS for internal Service Gateway")
-
+	excludeDirFile = flag.String("exclude-dir", "", "Path to file containing directories to exclude from the scan")
+    
+	excludedDirs   map[string]struct{} // Set to store directories to exclude from the scan
 	totalScanned    int64                    // Counter for total files scanned, ensure thread-safe operations
 	filesWithMalware int64                   // Counter for files with malware found
 	filesClean      int64                    // Counter for files with no issues
@@ -77,6 +80,34 @@ func testAuth(client *amaasclient.AmaasClient) error {
 	} else {
 		return nil
 	}
+}
+
+func loadExcludedDirs() error {
+    if *excludeDirFile == "" {
+        return nil // No exclusion file provided
+    }
+
+    file, err := os.Open(*excludeDirFile)
+    if err != nil {
+        return fmt.Errorf("Error opening exclusion file: %v", err)
+    }
+    defer file.Close()
+
+    excludedDirs = make(map[string]struct{})
+
+    scanner := bufio.NewScanner(file)
+    for scanner.Scan() {
+        dir := strings.TrimSpace(scanner.Text())
+        if dir != "" {
+            excludedDirs[dir] = struct{}{}
+        }
+    }
+
+    if err := scanner.Err(); err != nil {
+        return fmt.Errorf("Error reading exclusion file: %v", err)
+    }
+
+    return nil
 }
 
 func main() {
@@ -103,6 +134,11 @@ func main() {
 	if *directory == "" {
 		flag.PrintDefaults()
 		log.Fatal("Missing required argument: -directory")
+	}
+
+	// Load exclusion directories if provided
+	if err := loadExcludedDirs(); err != nil {
+		log.Fatalf("Error loading exclusion directories: %v", err)
 	}
 
 	// Create Vision One client
@@ -192,6 +228,14 @@ func main() {
 // Function to recursively scan a directory
 func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileChannel chan struct{}) {
 	defer waitGroup.Done()
+
+	// Check if the directory or its parent is in the exclusion list
+	for excludedDir := range excludedDirs {
+		if strings.HasPrefix(directory, excludedDir) {
+			log.Printf("Skipping excluded directory or subdirectory: %s\n", directory)
+			return
+		}
+	}
 
 	// Read directory contents
 	files, err := os.ReadDir(directory)
