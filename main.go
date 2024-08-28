@@ -227,49 +227,81 @@ func main() {
 
 // Function to recursively scan a directory
 func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileChannel chan struct{}) {
-	defer waitGroup.Done()
+    defer waitGroup.Done()
 
-	// Check if the directory or its parent is in the exclusion list
-	for excludedDir := range excludedDirs {
-		if strings.HasPrefix(directory, excludedDir) {
-			log.Printf("Skipping excluded directory or subdirectory: %s\n", directory)
-			return
-		}
-	}
+    // Normalize the directory path
+    normalizedDir := filepath.Clean(directory)
 
-	// Read directory contents
-	files, err := os.ReadDir(directory)
-	if err != nil {
-		log.Printf("Error reading directory: %v\n", err)
-		return
-	}
+    // Log the directory being considered
+    if *verbose {
+        log.Printf("Considering directory: %s\n", normalizedDir)
+    }
 
-	for _, f := range files {
-		fp := filepath.Join(directory, f.Name())
-		if f.IsDir() {
-			waitGroup.Add(1)
-			go scanDirectory(client, fp, scanFileChannel) // Recursive call for subdirectories
-		} else {
-			waitGroup.Add(1)
-			go func(filePath string) {
-				scanFileChannel <- struct{}{} // Control concurrency
-				if err := scanFile(client, filePath); err != nil {
-					log.Printf("Error scanning file: %v\n", err)
-				}
-				<-scanFileChannel
-				waitGroup.Done()
-			}(fp)
-		}
-	}
+    // Check if the directory or any parent directory is in the exclusion list
+    for excludedDir := range excludedDirs {
+        normalizedExcludedDir := filepath.Clean(excludedDir)
+        if strings.HasPrefix(normalizedDir, normalizedExcludedDir) {
+            if *verbose {
+                log.Printf("Skipping excluded directory or subdirectory: %s\n", directory)
+            }
+            return
+        }
+    }
+
+    // Read directory contents
+    files, err := os.ReadDir(directory)
+    if err != nil {
+        if *verbose {
+            log.Printf("Error reading directory: %v\n", err)
+        }
+        return
+    }
+
+    if *verbose && len(files) == 0 {
+        log.Printf("Directory is empty: %s\n", directory)
+    }
+
+    for _, f := range files {
+        fp := filepath.Join(directory, f.Name())
+        if f.IsDir() {
+            waitGroup.Add(1)
+            if *verbose {
+                log.Printf("Descending into directory: %s\n", fp)
+            }
+            go scanDirectory(client, fp, scanFileChannel) // Recursive call for subdirectories
+        } else {
+            waitGroup.Add(1)
+            go func(filePath string) {
+                scanFileChannel <- struct{}{} // Control concurrency
+                if *verbose {
+                    log.Printf("Considering file: %s\n", filePath)
+                }
+                if err := scanFile(client, filePath); err != nil {
+                    if *verbose {
+                        log.Printf("Error scanning file: %v\n", err)
+                    }
+                }
+                <-scanFileChannel
+                waitGroup.Done()
+            }(fp)
+        }
+    }
 }
 
 func scanFile(client *amaasclient.AmaasClient, filePath string) error {
     start := time.Now()
 
+    // Log the file being considered if verbose mode is on
+    if *verbose {
+        log.Printf("Considering file: %s\n", filePath)
+    }
+
     // Try to open the file to check if it can be accessed
     file, err := os.Open(filePath)
     if err != nil {
-        log.Printf("Error opening file %s: %v\n", filePath, err)
+        if *verbose {
+            log.Printf("Error opening file %s: %v\n", filePath, err)
+        }
         return err
     }
 
@@ -278,16 +310,21 @@ func scanFile(client *amaasclient.AmaasClient, filePath string) error {
     file.Close() // Close the file as soon as we're done with it
 
     if err != nil {
-        log.Printf("Error getting file info for %s: %v\n", filePath, err)
+        if *verbose {
+            log.Printf("Error getting file info for %s: %v\n", filePath, err)
+        }
         return err
     }
 
     // Skip special files (e.g., directories, sockets, device files)
     if fileInfo.Mode().IsDir() || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.Mode()&os.ModeNamedPipe != 0 || fileInfo.Mode()&os.ModeSocket != 0 {
-        log.Printf("Skipping special file %s\n", filePath)
+        if *verbose {
+            log.Printf("Skipping special file %s\n", filePath)
+        }
         return nil
     }
 
+    // Continue with the scanning process...
     defer func() {
         atomic.AddInt64(&totalScanned, 1) // Thread-safe increment
         mu.Lock()
@@ -296,16 +333,15 @@ func scanFile(client *amaasclient.AmaasClient, filePath string) error {
         mu.Unlock()
     }()
 
-    // Output the file being scanned
-    fmt.Printf("Scanning: %s\n", filePath)
-
     // Call Vision One SDK to scan the file
     rawResult, err := client.ScanFile(filePath, tags)
     if err == nil {
         var result ScanResult
         err := json.Unmarshal([]byte(rawResult), &result)
         if err != nil {
-            log.Printf("Error parsing scan result for file %s: %v\n", filePath, err)
+            if *verbose {
+                log.Printf("Error parsing scan result for file %s: %v\n", filePath, err)
+            }
             return err
         }
 
@@ -323,7 +359,7 @@ func scanFile(client *amaasclient.AmaasClient, filePath string) error {
     }
 
     // Print concise output to the terminal
-    if err == nil {
+    if err == nil && *verbose {
         fmt.Printf("Scanned: %s [scanned in %s]\n", filePath, time.Since(start))
     }
 
