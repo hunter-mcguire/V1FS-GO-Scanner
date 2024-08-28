@@ -43,6 +43,7 @@ var (
 	maxScanWorkers   = flag.Int("maxWorkers", 100, "Max number concurrent file scans Unlimited: -1")
 	internal_address = flag.String("internal_address", "", "Internal Service Gateway Address")
 	internal_tls     = flag.Bool("internal_tls", true, "Use TLS for internal Service Gateway")
+	digest_disable   = flag.Bool("digest_disable", false, "Disable digest calculation")
 
 	totalScanned int64                    // Counter for total files scanned, ensure thread-safe operations
 	waitGroup    sync.WaitGroup           // WaitGroup for synchronization
@@ -87,7 +88,7 @@ func main() {
 
 	// Create Vision One client
 	if *internal_address != "" {
-		client, err = amaasclient.NewClientInternal(v1ApiKey, *internal_address, *internal_tls)
+		client, err = amaasclient.NewClientInternal(v1ApiKey, *internal_address, *internal_tls, "")
 		if err != nil {
 			log.Fatalf("Error creating client: %v", err)
 		}
@@ -104,6 +105,10 @@ func main() {
 
 	if *feedback {
 		client.SetFeedbackEnable()
+	}
+
+	if *digest_disable {
+		client.SetDigestDisable()
 	}
 
 	authTest := testAuth(client)
