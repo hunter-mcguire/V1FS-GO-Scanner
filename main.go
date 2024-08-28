@@ -43,7 +43,7 @@ var (
 	maxScanWorkers   = flag.Int("maxWorkers", 100, "Max number concurrent file scans Unlimited: -1")
 	internal_address = flag.String("internal_address", "", "Internal Service Gateway Address")
 	internal_tls     = flag.Bool("internal_tls", true, "Use TLS for internal Service Gateway")
-	digest_disable   = flag.Bool("digest_disable", false, "Disable digest calculation")
+	disable_digest   = flag.Bool("disable_digest", false, "Disable digest calculation")
 
 	totalScanned int64                    // Counter for total files scanned, ensure thread-safe operations
 	waitGroup    sync.WaitGroup           // WaitGroup for synchronization
@@ -107,7 +107,7 @@ func main() {
 		client.SetFeedbackEnable()
 	}
 
-	if *digest_disable {
+	if *disable_digest {
 		client.SetDigestDisable()
 	}
 
