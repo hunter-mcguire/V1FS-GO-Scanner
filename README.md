@@ -6,7 +6,7 @@ Link to Github SDK Repo: https://github.com/trendmicro/tm-v1-fs-golang-sdk
 <br>
 
 | Paramater| Type | Description |
-| ----------- | ----------- | ----------- |
+| ------------ | ------------ | ------------ |
 -apiKey | *string* | Vision One API Key / V1_FS_KEY environment variable *
 -directory | *string* | Path to Directory to scan recursively * 
 -maxWorkers | *int* | Max number concurrent file scans. Default: 100,  Unlimited: -1
@@ -16,15 +16,14 @@ Link to Github SDK Repo: https://github.com/trendmicro/tm-v1-fs-golang-sdk
 -feedback | *bool* | Enable Smart Protection Network feedback. Default: false
 -internal_address | *string* | Internal Service Gateway Address.
 -internal_tls | *bool* | Use TLS for internal Service Gateway
+-disable_digest | *bool* | Disable digest calculation. Default: false
 -verbose | *bool* | Logs all scans to stdout. Default: false
 
 <br>
-*Note the required paramaters are marked with an asterisk
-<br>
-<br>
+
+*Note the required paramaters are marked with an asterisk*
+
 *Allowed bool values: true | false*
-<br>
-<br>
 
 ### Example Usage: <br><br>
 Usage to cloud based scanner

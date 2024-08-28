@@ -2,7 +2,7 @@ module github.com/hunter-mcguire/V1FS-GO-Scanner
 
 go 1.22.0
 
-require github.com/trendmicro/tm-v1-fs-golang-sdk v1.2.0
+require github.com/trendmicro/tm-v1-fs-golang-sdk v1.4.1
 
 require (
 	github.com/golang/protobuf v1.5.4 // indirect
