@@ -15,6 +15,7 @@ Link to Github SDK Repo: https://github.com/trendmicro/tm-v1-fs-golang-sdk
 -pml | *bool* | Enable predictive machine learning detection. Default: false
 -feedback | *bool* | Enable Smart Protection Network feedback. Default: false
 -verbose | *bool* | Logs all scans to stdout. Default: false
+-exclude-dir | *string* 
 
 <br>
 *Note the required paramaters are marked with an asterisk* *
@@ -26,7 +27,7 @@ Link to Github SDK Repo: https://github.com/trendmicro/tm-v1-fs-golang-sdk
 
 ### Example Usage: <br><br>
 ```sh
-./v1_fs_go_scanner -apiKey=<v1_api_key> -directory=/tmp/some_folder -maxWorkers=200 -tags=dev,us-east-1,temp_project -verbose=true
+./v1_fs_go_scanner -apiKey=<v1_api_key> -directory=/tmp/some_folder -maxWorkers=200 -tags=dev,us-east-1,temp_project -verbose=true -exclude-dir exclusion_dir_list.txt
 ```
 <br>
 <br>
