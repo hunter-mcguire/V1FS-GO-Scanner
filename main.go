@@ -286,65 +286,77 @@ func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileCh
 }
 
 func scanFile(client *amaasclient.AmaasClient, filePath string, timeout time.Duration) error {
-	start := time.Now()
+    start := time.Now()
 
-	file, err := os.Open(filePath)
-	if err != nil {
-		logSkippedFile(filePath, err)
-		return err
-	}
-	fileInfo, err := file.Stat()
-	file.Close()
-	if err != nil {
-		logSkippedFile(filePath, err)
-		return err
-	}
+    // Open the file
+    file, err := os.Open(filePath)
+    if err != nil {
+        logSkippedFile(filePath, err) // Log skipped files
+        return err
+    }
+    fileInfo, err := file.Stat()
+    file.Close()
+    if err != nil {
+        logSkippedFile(filePath, err)
+        return err
+    }
 
-	if fileInfo.Mode().IsDir() || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.Mode()&os.ModeNamedPipe != 0 || fileInfo.Mode()&os.ModeSocket != 0 {
-		return nil
-	}
+    // Skip directories, symlinks, named pipes, or sockets
+    if fileInfo.Mode().IsDir() || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.Mode()&os.ModeNamedPipe != 0 || fileInfo.Mode()&os.ModeSocket != 0 {
+        return nil
+    }
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+    // Context with timeout for scanning
+    ctx, cancel := context.WithTimeout(context.Background(), timeout)
+    defer cancel()
 
-	scanErrChan := make(chan error, 1)
-	go func() {
-		rawResult, err := client.ScanFile(filePath, tags)
-		if err == nil {
-			var result ScanResult
-			err := json.Unmarshal([]byte(rawResult), &result)
-			if err == nil {
-				if len(result.FoundMalwares) > 0 {
-					atomic.AddInt64(&filesWithMalware, 1)
-				} else {
-					atomic.AddInt64(&filesClean, 1)
-				}
+    scanErrChan := make(chan error, 1)
 
-				mu.Lock()
-				fmt.Fprintf(scanLog, "%s\n", rawResult)
-				mu.Unlock()
-			}
-		}
-		scanErrChan <- err
-	}()
+    // Perform scan in a goroutine
+    go func() {
+        rawResult, err := client.ScanFile(filePath, tags) // Perform the scan
+        if err == nil {
+            var result ScanResult
+            err := json.Unmarshal([]byte(rawResult), &result)
+            if err == nil {
+                // Track results based on malware detection
+                if len(result.FoundMalwares) > 0 {
+                    atomic.AddInt64(&filesWithMalware, 1)
+                } else {
+                    atomic.AddInt64(&filesClean, 1)
+                }
 
-	select {
-	case <-ctx.Done():
-		log.Printf("File scan timed out: %s\n", filePath)
-		logSkippedFile(filePath, fmt.Errorf("scan timed out"))
-		return ctx.Err()
-	case scanErr := <-scanErrChan:
-		if scanErr != nil {
-			logSkippedFile(filePath, scanErr)
-			return scanErr
-		}
-	}
+                // Log results
+                mu.Lock()
+                fmt.Fprintf(scanLog, "%s\n", rawResult)
+                mu.Unlock()
+            }
+        }
+        scanErrChan <- err
+    }()
 
-	atomic.AddInt64(&totalScanned, 1)
-	mu.Lock()
-	fmt.Fprintf(scanLog, "Scanned: %s, Duration: %s\n", filePath, time.Since(start))
-	mu.Unlock()
-	return nil
+    // Handle timeout or scan completion
+    select {
+    case <-ctx.Done():
+        log.Printf("File scan timed out: %s\n", filePath)
+        logSkippedFile(filePath, fmt.Errorf("scan timed out"))
+        return ctx.Err()
+    case scanErr := <-scanErrChan:
+        if scanErr != nil {
+            logSkippedFile(filePath, scanErr)
+            return scanErr
+        }
+    }
+
+    // Increment scanned file counter
+    atomic.AddInt64(&totalScanned, 1)
+
+    // Log scan completion
+    mu.Lock()
+    fmt.Fprintf(scanLog, "Scanned: %s, Duration: %s\n", filePath, time.Since(start))
+    mu.Unlock()
+
+    return nil
 }
 
 func logSkippedFile(filePath string, err error) {
