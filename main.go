@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"bufio"
 	"encoding/json"
 	"flag"
@@ -119,6 +118,10 @@ func main() {
 	var v1ApiKey string
 	var err error
 
+	// Get timeout limit from the flag
+	timeout := time.Duration(*timeoutLimit) * time.Second
+
+
 	// Check for required arguments
 	k, e := os.LookupEnv("V1_FS_KEY")
 	if e {
@@ -205,7 +208,7 @@ func main() {
 	// Start scanning the initial directory
 	startTime := time.Now()
 	waitGroup.Add(1)
-	go scanDirectory(client, *directory, scanFileChannel)
+	go scanDirectory(client, *directory, scanFileChannel, timeout)
 
 	// Wait for all goroutines to finish before exiting
 	waitGroup.Wait()
@@ -223,20 +226,15 @@ func main() {
 	fmt.Printf("Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
 	fmt.Printf("Files with Malware: %d\n", atomic.LoadInt64(&filesWithMalware))
 	fmt.Printf("Files Clean: %d\n", atomic.LoadInt64(&filesClean))
-	fmt.Printf("Total Scan Time: %s\n", timeTaken)
+	fmt.Printf("Total Scan Time: %s\n", time.Since(startTime))
 }
 
 // Function to recursively scan a directory
-func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileChannel chan struct{}) {
-    defer waitGroup.Done()
+func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileChannel chan struct{}, timeout time.Duration) {
+    defer waitGroup.Done() // Ensure WaitGroup counter decrements when the function exits
 
     // Normalize the directory path
     normalizedDir := filepath.Clean(directory)
-
-    // Log the directory being considered
-    if *verbose {
-        log.Printf("Considering directory: %s\n", normalizedDir)
-    }
 
     // Check if the directory or any parent directory is in the exclusion list
     for excludedDir := range excludedDirs {
@@ -245,7 +243,7 @@ func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileCh
             if *verbose {
                 log.Printf("Skipping excluded directory or subdirectory: %s\n", directory)
             }
-            return
+            return // Skip this directory entirely
         }
     }
 
@@ -255,29 +253,25 @@ func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileCh
         if *verbose {
             log.Printf("Error reading directory: %v\n", err)
         }
-        return
+        return // Exit if the directory cannot be read
     }
 
-    if *verbose && len(files) == 0 {
-        log.Printf("Directory is empty: %s\n", directory)
-    }
-
-    for _, f := range files {
+    for _, f := range files { // Iterate over directory contents
         fp := filepath.Join(directory, f.Name())
-        if f.IsDir() {
+        if f.IsDir() { // Process subdirectories recursively
             waitGroup.Add(1)
             if *verbose {
                 log.Printf("Descending into directory: %s\n", fp)
             }
-            go scanDirectory(client, fp, scanFileChannel) // Recursive call for subdirectories
-        } else {
+            go scanDirectory(client, fp, scanFileChannel, timeout)
+        } else { // Process individual files
             waitGroup.Add(1)
             go func(filePath string) {
-                scanFileChannel <- struct{}{} // Control concurrency
+                scanFileChannel <- struct{}{} // Concurrency control
                 if *verbose {
                     log.Printf("Considering file: %s\n", filePath)
                 }
-                if err := scanFile(client, filePath); err != nil {
+                if err := scanFile(client, filePath, timeout); err != nil {
                     if *verbose {
                         log.Printf("Error scanning file: %v\n", err)
                     }
@@ -289,9 +283,8 @@ func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileCh
     }
 }
 
-func scanFile(client *amaasclient.AmaasClient, filePath string) error {
+func scanFile(client *amaasclient.AmaasClient, filePath string, timeout time.Duration) error {
     start := time.Now()
-    timeout := 10 * time.Second // Set timeout duration
 
     // Log the file being considered if verbose mode is on
     if *verbose {
@@ -347,7 +340,6 @@ func scanFile(client *amaasclient.AmaasClient, filePath string) error {
                     atomic.AddInt64(&filesClean, 1)
                 }
 
-                // Log the result of the scan in JSON format (for detailed review)
                 mu.Lock()
                 fmt.Fprintf(scanLog, "%s\n", rawResult)
                 mu.Unlock()
@@ -358,16 +350,12 @@ func scanFile(client *amaasclient.AmaasClient, filePath string) error {
 
     select {
     case <-ctx.Done():
-        if *verbose {
-            log.Printf("File scan timed out: %s\n", filePath)
-        }
+        log.Printf("File scan timed out: %s\n", filePath)
         logSkippedFile(filePath, fmt.Errorf("scan timed out"))
         return ctx.Err()
     case scanErr := <-scanErrChan:
         if scanErr != nil {
-            if *verbose {
-                log.Printf("Error scanning file %s: %v\n", filePath, scanErr)
-            }
+            log.Printf("Error scanning file %s: %v\n", filePath, scanErr)
             logSkippedFile(filePath, scanErr)
             return scanErr
         }
