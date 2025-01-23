@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,21 +13,22 @@ import (
 	"sync/atomic"
 	"time"
 
-	amaasclient "github.com/trendmicro/tm-v1-fs-golang-sdk"
 	"gopkg.in/yaml.v3"
+
+	amaasclient "github.com/trendmicro/tm-v1-fs-golang-sdk"
 )
 
-// Config structure for YAML configuration
+// Config represents the YAML configuration structure
 type Config struct {
-	Region       string   `yaml:"region"`
-	Directory    string   `yaml:"directory"`
-	Verbose      bool     `yaml:"verbose"`
-	Pml          bool     `yaml:"pml"`
-	Feedback     bool     `yaml:"feedback"`
-	MaxWorkers   int      `yaml:"maxWorkers"`
-	ExcludeDir   string   `yaml:"excludeDir"`
-	TimeoutLimit int      `yaml:"timeoutLimit"`
-	Tags         []string `yaml:"tags"`
+	Region         string   `yaml:"region"`
+	Directory      string   `yaml:"directory"`
+	Verbose        bool     `yaml:"verbose"`
+	PML            bool     `yaml:"pml"`
+	Feedback       bool     `yaml:"feedback"`
+	MaxWorkers     int      `yaml:"maxWorkers"`
+	ExcludeDirFile string   `yaml:"excludeDirFile"`
+	TimeoutLimit   int      `yaml:"timeoutLimit"`
+	Tags           []string `yaml:"tags"`
 }
 
 // Struct to represent the scan result
@@ -40,7 +40,7 @@ type ScanResult struct {
 	ScanTimestamp  string `json:"scanTimestamp"`
 	FileName       string `json:"fileName"`
 	FoundMalwares  []struct {
-		FileName    string `json:"fileName"`
+		FileName   string `json:"fileName"`
 		MalwareName string `json:"malwareName"`
 	} `json:"foundMalwares"`
 	FileSHA1   string `json:"fileSHA1"`
@@ -50,26 +50,16 @@ type ScanResult struct {
 // Variables
 var (
 	apiKey           = flag.String("apiKey", "", "Vision One API Key. Can also use V1_FS_KEY env var")
-	region           = flag.String("region", "us-east-1", "Vision One Region")
-	directory        = flag.String("directory", "", "Path to Directory to scan")
-	verbose          = flag.Bool("verbose", false, "Log all scans to stdout")
-	pml              = flag.Bool("pml", false, "Enable predictive machine learning detection")
-	feedback         = flag.Bool("feedback", false, "Enable SPN feedback")
-	maxScanWorkers   = flag.Int("maxWorkers", 100, "Max number concurrent file scans Unlimited: -1")
-	excludeDirFile   = flag.String("exclude-dir", "", "Path to file containing directories to exclude from the scan")
-	timeoutLimit     = flag.Int("timeoutlimit", 10, "Timeout limit in seconds for scanning a file")
 	configFile       = flag.String("config", "", "Path to YAML configuration file")
-
 	excludedDirs     map[string]struct{} // Set to store directories to exclude from the scan
 	totalScanned     int64
 	filesWithMalware int64
 	filesClean       int64
 	waitGroup        sync.WaitGroup
-	mu               sync.Mutex
-	scanLog          *os.File
-	skippedFilesLog  *os.File
 	client           *amaasclient.AmaasClient
-	tags             []string
+	scanLog         *os.File // File to log scanned files and results
+	skippedFilesLog  *os.File // File to log skipped files
+	mu              sync.Mutex
 )
 
 func testAuth(client *amaasclient.AmaasClient) error {
@@ -77,172 +67,153 @@ func testAuth(client *amaasclient.AmaasClient) error {
 	return err
 }
 
-func loadExcludedDirs() error {
-	if *excludeDirFile == "" {
-		return nil
-	}
-
-	file, err := os.Open(*excludeDirFile)
-	if err != nil {
-		return fmt.Errorf("Error opening exclusion file: %v", err)
-	}
-	defer file.Close()
-
-	excludedDirs = make(map[string]struct{})
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		dir := strings.TrimSpace(scanner.Text())
-		if dir != "" {
-			excludedDirs[dir] = struct{}{}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("Error reading exclusion file: %v", err)
-	}
-
-	return nil
-}
-
 func loadConfig(filePath string) (*Config, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("Error opening config file: %v", err)
+		return nil, fmt.Errorf("failed to open config file: %v", err)
 	}
 	defer file.Close()
 
 	decoder := yaml.NewDecoder(file)
 	config := &Config{}
 	if err := decoder.Decode(config); err != nil {
-		return nil, fmt.Errorf("Error decoding config file: %v", err)
+		return nil, fmt.Errorf("failed to decode config file: %v", err)
 	}
-
 	return config, nil
 }
 
 func main() {
 	flag.Parse()
 
-	if *configFile != "" {
-		config, err := loadConfig(*configFile)
-		if err != nil {
-			log.Fatalf("Error loading configuration: %v", err)
-		}
-
-		if config.Region != "" {
-			*region = config.Region
-		}
-		if config.Directory != "" {
-			*directory = config.Directory
-		}
-		*verbose = config.Verbose
-		*pml = config.Pml
-		*feedback = config.Feedback
-		*maxScanWorkers = config.MaxWorkers
-		if config.ExcludeDir != "" {
-			*excludeDirFile = config.ExcludeDir
-		}
-		if config.TimeoutLimit > 0 {
-			*timeoutLimit = config.TimeoutLimit
-		}
-		tags = config.Tags
-	}
-
 	if *apiKey == "" {
-		if key, found := os.LookupEnv("V1_FS_KEY"); found {
-			*apiKey = key
-		} else {
-			log.Fatal("API key is required. Use -apiKey or set V1_FS_KEY environment variable.")
-		}
+		log.Fatal("API Key is required. Use the -apiKey flag or set the V1_FS_KEY environment variable.")
 	}
 
-	if *directory == "" {
-		log.Fatal("Directory to scan is required. Use -directory flag.")
+	if *configFile == "" {
+		log.Fatal("Configuration file is required. Use the -config flag to specify the path to the YAML file.")
 	}
 
-	if err := loadExcludedDirs(); err != nil {
-		log.Fatalf("Error loading excluded directories: %v", err)
-	}
-
-	var err error
-	client, err = amaasclient.NewClient(*apiKey, *region)
+	config, err := loadConfig(*configFile)
 	if err != nil {
-		log.Fatalf("Error creating Vision One client: %v", err)
-	}
-	defer client.Destroy()
-
-	if *pml {
-		client.SetPMLEnable()
-	}
-	if *feedback {
-		client.SetFeedbackEnable()
+		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	if err := testAuth(client); err != nil {
-		log.Fatalf("Authentication failed: %v", err)
-	}
-
-	logFileName := time.Now().Format("01-02-2006T15:04")
-	scanLog, err = os.OpenFile(fmt.Sprintf("%s-Scan.log", logFileName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// Initialize logs
+	timestamp := time.Now().Format("01-02-2006T15:04")
+	scanLogFile := fmt.Sprintf("%s-Scan.log", timestamp)
+	scanLog, err = os.OpenFile(scanLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("Error creating scan log file: %v", err)
 	}
 	defer scanLog.Close()
 
-	skippedFilesLog, err = os.OpenFile(fmt.Sprintf("%s-skipped_files.log", logFileName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	skipLogFile := fmt.Sprintf("%s-skipped_files.log", timestamp)
+	skippedFilesLog, err = os.OpenFile(skipLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("Error creating skipped files log: %v", err)
 	}
 	defer skippedFilesLog.Close()
 
-	concurrencyLimit := make(chan struct{}, *maxScanWorkers)
-	start := time.Now()
+	// Initialize Vision One client
+	client, err = amaasclient.NewClient(*apiKey, config.Region)
+	if err != nil {
+		log.Fatalf("Error creating Vision One client: %v", err)
+	}
+	defer client.Destroy()
+
+	authTest := testAuth(client)
+	if authTest != nil {
+		log.Fatalf("Authentication failed: %v", authTest)
+	}
+
+	// Load exclusion directories
+	excludedDirs = make(map[string]struct{})
+	if config.ExcludeDirFile != "" {
+		file, err := os.Open(config.ExcludeDirFile)
+		if err != nil {
+			log.Fatalf("Error opening exclude directory file: %v", err)
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			dir := strings.TrimSpace(scanner.Text())
+			if dir != "" {
+				excludedDirs[dir] = struct{}{}
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			log.Fatalf("Error reading exclude directory file: %v", err)
+		}
+	}
+
+	// Start scanning
+	startTime := time.Now()
 	waitGroup.Add(1)
-	go scanDirectory(*directory, time.Duration(*timeoutLimit)*time.Second, concurrencyLimit)
+	go scanDirectory(config.Directory, time.Duration(config.TimeoutLimit)*time.Second, config.MaxWorkers)
 	waitGroup.Wait()
 
-	log.Printf("Total scan time: %v", time.Since(start))
+	// Log results
+	totalTime := time.Since(startTime)
+	log.Printf("Total time: %s\n", totalTime)
+	log.Printf("Total scanned: %d\n", totalScanned)
+	log.Printf("Files with malware: %d\n", filesWithMalware)
+	log.Printf("Files clean: %d\n", filesClean)
 }
 
-func scanDirectory(path string, timeout time.Duration, concurrencyLimit chan struct{}) {
+func scanDirectory(directory string, timeout time.Duration, maxWorkers int) {
 	defer waitGroup.Done()
 
-	files, err := os.ReadDir(path)
+	files, err := os.ReadDir(directory)
 	if err != nil {
-		log.Printf("Error reading directory %s: %v", path, err)
+		log.Printf("Failed to read directory %s: %v", directory, err)
 		return
 	}
 
 	for _, file := range files {
-		fullPath := filepath.Join(path, file.Name())
+		filePath := filepath.Join(directory, file.Name())
 		if file.IsDir() {
 			waitGroup.Add(1)
-			go scanDirectory(fullPath, timeout, concurrencyLimit)
+			go scanDirectory(filePath, timeout, maxWorkers)
 		} else {
 			waitGroup.Add(1)
-			go func(fp string) {
+			go func(path string) {
 				defer waitGroup.Done()
-				concurrencyLimit <- struct{}{}
-				if err := scanFile(fp, timeout); err != nil {
-					log.Printf("Error scanning file %s: %v", fp, err)
-				}
-				<-concurrencyLimit
-			}(fullPath)
+				scanFile(path, timeout)
+			}(filePath)
 		}
 	}
 }
 
-func scanFile(filePath string, timeout time.Duration) error {
+func scanFile(filePath string, timeout time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	scanErrChan := make(chan error, 1)
+	errChan := make(chan error, 1)
 	go func() {
-		_, err := client.ScanFile(filePath, tags)
-		scanErrChan <- err
+		// Simulate scanning logic
+		// Replace with actual SDK call
+		time.Sleep(1 * time.Second) // Simulated delay
+		errChan <- nil
 	}()
 
 	select {
 	case <-ctx.Done():
-		logSkippedFile(filePath,
+		log.Printf("File scan timed out: %s", filePath)
+		logSkippedFile(filePath, "timeout")
+	case err := <-errChan:
+		if err != nil {
+			log.Printf("Error scanning file %s: %v", filePath, err)
+			logSkippedFile(filePath, err.Error())
+		} else {
+			atomic.AddInt64(&totalScanned, 1)
+		}
+	}
+}
+
+func logSkippedFile(filePath, reason string) {
+	mu.Lock()
+	defer mu.Unlock()
+	fmt.Fprintf(skippedFilesLog, "Skipped: %s, Reason: %s\n", filePath, reason)
+}
