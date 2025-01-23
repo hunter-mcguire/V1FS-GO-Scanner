@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -13,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 	"bufio"
+	"encoding/json"
 	"gopkg.in/yaml.v3"
 
 	amaasclient "github.com/trendmicro/tm-v1-fs-golang-sdk"
@@ -31,7 +31,6 @@ type Config struct {
 	Tags           []string `yaml:"tags"`
 }
 
-// ScanResult represents the structure of a scan result
 type ScanResult struct {
 	ScannerVersion string `json:"scannerVersion"`
 	SchemaVersion  string `json:"schemaVersion"`
@@ -47,19 +46,24 @@ type ScanResult struct {
 	FileSHA256 string `json:"fileSHA256"`
 }
 
-// Variables
 var (
 	apiKey           = flag.String("apiKey", "", "Vision One API Key. Can also use V1_FS_KEY env var")
 	configFile       = flag.String("config", "", "Path to YAML configuration file")
-	excludedDirs     map[string]struct{} // Set to store directories to exclude from the scan
+	excludedDirs     map[string]struct{}
 	totalScanned     int64
 	filesWithMalware int64
 	filesClean       int64
 	waitGroup        sync.WaitGroup
 	client           *amaasclient.AmaasClient
-	scanLog          *os.File // File to log scanned files and results
+	scanLog          *os.File
+	skippedFilesLog   *os.File
 	mu               sync.Mutex
 )
+
+func testAuth(client *amaasclient.AmaasClient) error {
+	_, err := client.ScanBuffer([]byte(""), "testAuth", nil)
+	return err
+}
 
 func loadConfig(filePath string) (*Config, error) {
 	file, err := os.Open(filePath)
@@ -74,97 +78,6 @@ func loadConfig(filePath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to decode config file: %v", err)
 	}
 	return config, nil
-}
-
-func testAuth(client *amaasclient.AmaasClient) error {
-	_, err := client.ScanBuffer([]byte(""), "testAuth", nil)
-	return err
-}
-
-func loadExcludedDirs(filePath string) error {
-	excludedDirs = make(map[string]struct{})
-	if filePath == "" {
-		return nil
-	}
-
-	file, err := os.Open(filePath)
-	if err != nil {
-		return fmt.Errorf("error opening exclude directory file: %v", err)
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		dir := strings.TrimSpace(scanner.Text())
-		if dir != "" {
-			excludedDirs[dir] = struct{}{}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading exclude directory file: %v", err)
-	}
-	return nil
-}
-
-func scanDirectory(directory string, timeout time.Duration, tags []string) {
-	defer waitGroup.Done()
-
-	// Check if directory is excluded
-	normalizedDir := filepath.Clean(directory)
-	for excludedDir := range excludedDirs {
-		if strings.HasPrefix(normalizedDir, excludedDir) {
-			log.Printf("Skipping excluded directory: %s\n", directory)
-			return
-		}
-	}
-
-	files, err := os.ReadDir(directory)
-	if err != nil {
-		log.Printf("Failed to read directory %s: %v", directory, err)
-		return
-	}
-
-	for _, file := range files {
-		filePath := filepath.Join(directory, file.Name())
-		if file.IsDir() {
-			waitGroup.Add(1)
-			go scanDirectory(filePath, timeout, tags)
-		} else {
-			waitGroup.Add(1)
-			go func(path string) {
-				defer waitGroup.Done()
-				scanFile(path, timeout, tags)
-			}(filePath)
-		}
-	}
-}
-
-func scanFile(filePath string, timeout time.Duration, tags []string) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	rawResult, err := client.ScanFile(filePath, tags)
-	if err != nil {
-		log.Printf("Error scanning file %s: %v", filePath, err)
-		return
-	}
-
-	var result ScanResult
-	if err := json.Unmarshal([]byte(rawResult), &result); err != nil {
-		log.Printf("Error parsing scan result for file %s: %v", filePath, err)
-		return
-	}
-
-	atomic.AddInt64(&totalScanned, 1)
-
-	if len(result.FoundMalwares) > 0 {
-		atomic.AddInt64(&filesWithMalware, 1)
-		log.Printf("Malware found in file %s: %+v", filePath, result.FoundMalwares)
-	} else {
-		atomic.AddInt64(&filesClean, 1)
-		log.Printf("File clean: %s", filePath)
-	}
 }
 
 func main() {
@@ -183,30 +96,6 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// Load exclusion directories
-	if err := loadExcludedDirs(config.ExcludeDirFile); err != nil {
-		log.Fatalf("Error loading exclusion directories: %v", err)
-	}
-
-	// Initialize Vision One client
-	client, err = amaasclient.NewClient(*apiKey, config.Region)
-	if err != nil {
-		log.Fatalf("Error creating Vision One client: %v", err)
-	}
-	defer client.Destroy()
-
-	if config.PML {
-		client.SetPMLEnable()
-	}
-	if config.Feedback {
-		client.SetFeedbackEnable()
-	}
-
-	authTest := testAuth(client)
-	if authTest != nil {
-		log.Fatalf("Authentication failed: %v", authTest)
-	}
-
 	// Initialize logs
 	timestamp := time.Now().Format("01-02-2006T15:04")
 	scanLogFile := fmt.Sprintf("%s-Scan.log", timestamp)
@@ -216,13 +105,150 @@ func main() {
 	}
 	defer scanLog.Close()
 
+	skipLogFile := fmt.Sprintf("%s-skipped_files.log", timestamp)
+	skippedFilesLog, err = os.OpenFile(skipLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Error creating skipped files log: %v", err)
+	}
+	defer skippedFilesLog.Close()
+
+	// Initialize Vision One client
+	client, err = amaasclient.NewClient(*apiKey, config.Region)
+	if err != nil {
+		log.Fatalf("Error creating Vision One client: %v", err)
+	}
+	defer client.Destroy()
+
+	authTest := testAuth(client)
+	if authTest != nil {
+		log.Fatalf("Authentication failed: %v", authTest)
+	}
+
+	// Load exclusion directories
+	excludedDirs = make(map[string]struct{})
+	if config.ExcludeDirFile != "" {
+		file, err := os.Open(config.ExcludeDirFile)
+		if err != nil {
+			log.Fatalf("Error opening exclude directory file: %v", err)
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			dir := strings.TrimSpace(scanner.Text())
+			if dir != "" {
+				excludedDirs[dir] = struct{}{}
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			log.Fatalf("Error reading exclude directory file: %v", err)
+		}
+	}
+
+	// Start scanning
 	startTime := time.Now()
 	waitGroup.Add(1)
-	go scanDirectory(config.Directory, time.Duration(config.TimeoutLimit)*time.Second, config.Tags)
+	go scanDirectory(config.Directory, time.Duration(config.TimeoutLimit)*time.Second, config.MaxWorkers)
 	waitGroup.Wait()
 
-	log.Printf("Total time: %s", time.Since(startTime))
-	log.Printf("Total scanned: %d", totalScanned)
-	log.Printf("Files with malware: %d", filesWithMalware)
-	log.Printf("Files clean: %d", filesClean)
+	// Log results
+	totalTime := time.Since(startTime)
+	log.Printf("Total time: %s\n", totalTime)
+	log.Printf("Total scanned: %d\n", totalScanned)
+	log.Printf("Files with malware: %d\n", filesWithMalware)
+	log.Printf("Files clean: %d\n", filesClean)
+}
+
+func scanDirectory(directory string, timeout time.Duration, maxWorkers int) {
+	defer waitGroup.Done()
+
+	files, err := os.ReadDir(directory)
+	if err != nil {
+		log.Printf("Failed to read directory %s: %v", directory, err)
+		return
+	}
+
+	for _, file := range files {
+		filePath := filepath.Join(directory, file.Name())
+		if file.IsDir() {
+			waitGroup.Add(1)
+			go scanDirectory(filePath, timeout, maxWorkers)
+		} else {
+			waitGroup.Add(1)
+			go func(path string) {
+				defer waitGroup.Done()
+				scanFile(path, timeout)
+			}(filePath)
+		}
+	}
+}
+
+func scanFile(filePath string, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	errChan := make(chan error, 1)
+	go func() {
+		file, err := os.Open(filePath)
+		if err != nil {
+			errChan <- fmt.Errorf("error opening file %s: %v", filePath, err)
+			return
+		}
+		defer file.Close()
+
+		fileInfo, err := file.Stat()
+		if err != nil {
+			errChan <- fmt.Errorf("error getting file info for %s: %v", filePath, err)
+			return
+		}
+
+		if fileInfo.Mode().IsDir() || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.Mode()&os.ModeNamedPipe != 0 || fileInfo.Mode()&os.ModeSocket != 0 {
+			errChan <- nil // Skip special files
+			return
+		}
+
+		// Call Vision One SDK to scan the file
+		rawResult, err := client.ScanFile(filePath, nil)
+		if err != nil {
+			errChan <- err
+			return
+		}
+
+		var result ScanResult
+		if err := json.Unmarshal([]byte(rawResult), &result); err != nil {
+			errChan <- fmt.Errorf("error parsing scan result for file %s: %v", filePath, err)
+			return
+		}
+
+		if len(result.FoundMalwares) > 0 {
+			atomic.AddInt64(&filesWithMalware, 1)
+		} else {
+			atomic.AddInt64(&filesClean, 1)
+		}
+
+		mu.Lock()
+		fmt.Fprintf(scanLog, "Scanned: %s, Result: %s\n", filePath, rawResult)
+		mu.Unlock()
+		errChan <- nil
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Printf("File scan timed out: %s", filePath)
+		logSkippedFile(filePath, "timeout")
+	case err := <-errChan:
+		if err != nil {
+			log.Printf("Error scanning file %s: %v", filePath, err)
+			logSkippedFile(filePath, err.Error())
+		} else {
+			atomic.AddInt64(&totalScanned, 1)
+		}
+	}
+}
+
+func logSkippedFile(filePath, reason string) {
+	mu.Lock()
+	defer mu.Unlock()
+	fmt.Fprintf(skippedFilesLog, "Skipped: %s, Reason: %s\n", filePath, reason)
 }
