@@ -40,7 +40,7 @@ verbose: true
 pml: false
 feedback: false
 maxWorkers: 200
-internalAddress: ""
+internalAddress: "127.0.0.1:8080"
 internalTLS: true
 excludeDir: "exclusion_dir_list.txt"
 timeoutLimit: 100
