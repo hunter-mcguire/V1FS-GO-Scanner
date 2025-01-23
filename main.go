@@ -242,47 +242,54 @@ defer client.Destroy()
 }
 
 func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileChannel chan struct{}, timeout time.Duration) {
-	defer waitGroup.Done()
-	normalizedDir := filepath.Clean(directory)
-	for excludedDir := range excludedDirs {
-		if strings.HasPrefix(normalizedDir, filepath.Clean(excludedDir)) {
-			if *verbose {
-				log.Printf("Skipping excluded directory: %s\n", directory)
-			}
-			return
-		}
-	}
+    defer waitGroup.Done()
 
-	files, err := os.ReadDir(directory)
-	if err != nil {
-		if *verbose {
-			log.Printf("Error reading directory: %v\n", err)
-		}
-		return
-	}
+    normalizedDir := filepath.Clean(directory)
 
-	for _, f := range files {
-		fp := filepath.Join(directory, f.Name())
-		if f.IsDir() {
-			waitGroup.Add(1)
-			if *verbose {
-				log.Printf("Descending into directory: %s\n", fp)
-			}
-			go scanDirectory(client, fp, scanFileChannel, timeout)
-		} else {
-			waitGroup.Add(1)
-			go func(filePath string) {
-				scanFileChannel <- struct{}{}
-				if err := scanFile(client, filePath, timeout); err != nil {
-					if *verbose {
-						log.Printf("Error scanning file: %v\n", err)
-					}
-				}
-				<-scanFileChannel
-				waitGroup.Done()
-			}(fp)
-		}
-	}
+    // Check exclusions
+    for excludedDir := range excludedDirs {
+        if strings.HasPrefix(normalizedDir, filepath.Clean(excludedDir)) {
+            if *verbose {
+                log.Printf("Skipping excluded directory\n")
+            }
+            return
+        }
+    }
+
+    // Sanitize the directory path
+    sanitizedDir := strings.ReplaceAll(directory, "/home/ubuntu", "[REDACTED]")
+
+    // Log sanitized directory action
+    if *verbose {
+        log.Printf("Descending into directory: %s\n", sanitizedDir)
+    }
+
+    // Process files in the directory (remaining logic unchanged)
+    files, err := os.ReadDir(directory)
+    if err != nil {
+        if *verbose {
+            log.Printf("Error reading directory: %v\n", err)
+        }
+        return
+    }
+
+    for _, f := range files {
+        fp := filepath.Join(directory, f.Name())
+        if f.IsDir() {
+            waitGroup.Add(1)
+            go scanDirectory(client, fp, scanFileChannel, timeout)
+        } else {
+            waitGroup.Add(1)
+            go func(filePath string) {
+                scanFileChannel <- struct{}{}
+                if err := scanFile(client, filePath, timeout); err != nil && *verbose {
+                    log.Printf("Error scanning file: %v\n", err)
+                }
+                <-scanFileChannel
+                waitGroup.Done()
+            }(fp)
+        }
+    }
 }
 
 func scanFile(client *amaasclient.AmaasClient, filePath string, timeout time.Duration) error {
