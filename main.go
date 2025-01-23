@@ -62,6 +62,7 @@ var (
 	internal_address = flag.String("internal_address", "", "Internal Service Gateway Address")
 	internal_tls     = flag.Bool("internal_tls", true, "Use TLS for internal Service Gateway")
 	excludeDirFile = flag.String("exclude-dir", "", "Path to file containing directories to exclude from the scan")
+	timeoutLimit = flag.Int("timeoutlimit", 10, "Timeout limit in seconds for scanning a file")
     
 	excludedDirs   map[string]struct{} // Set to store directories to exclude from the scan
 	totalScanned    int64                    // Counter for total files scanned, ensure thread-safe operations
@@ -72,7 +73,7 @@ var (
 	client          *amaasclient.AmaasClient // FS Client
 	mu              sync.Mutex               // Mutex for thread-safe access to log file
 	scanLog         *os.File                 // File to log scanned files and results
-	timeoutLimit = flag.Int("timeoutlimit", 10, "Timeout limit in seconds for scanning a file")
+	skippedFilesLog *os.File // File to log skipped files
 )
 
 func testAuth(client *amaasclient.AmaasClient) error {
@@ -117,8 +118,19 @@ func main() {
 	flag.Var(&tags, "tags", "Up to 8 strings separated by commas")
 	flag.Parse()
 
+    // Create timestamp-based log file name
+    timestamp := time.Now().Format("01-02-2006T15:04")
+    skipLogFile := fmt.Sprintf("%s-skipped_files.log", timestamp)
+
+
 	var v1ApiKey string
 	var err error
+	var err error
+    skippedFilesLog, err = os.OpenFile(skipLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    if err != nil {
+        log.Fatalf("Error creating skipped files log: %v", err)
+    }
+    defer skippedFilesLog.Close()
 
 	// Get timeout limit from the flag
 	timeout := time.Duration(*timeoutLimit) * time.Second
