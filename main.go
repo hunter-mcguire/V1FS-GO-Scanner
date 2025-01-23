@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"gopkg.in/yaml.v3"
 	"log"
 	"os"
 	"path/filepath"
@@ -16,268 +15,234 @@ import (
 	"time"
 
 	amaasclient "github.com/trendmicro/tm-v1-fs-golang-sdk"
+	"gopkg.in/yaml.v3"
 )
 
-// Config struct for YAML configuration
+// Config structure for YAML configuration
 type Config struct {
-	Region          string   `yaml:"region"`
-	Directory       string   `yaml:"directory"`
-	Verbose         bool     `yaml:"verbose"`
-	PML             bool     `yaml:"pml"`
-	Feedback        bool     `yaml:"feedback"`
-	MaxScanWorkers  int      `yaml:"maxWorkers"`
-	InternalAddress string   `yaml:"internalAddress"`
-	InternalTLS     bool     `yaml:"internalTLS"`
-	ExcludeDirFile  string   `yaml:"excludeDir"`
-	TimeoutLimit    int      `yaml:"timeoutLimit"`
-	Tags            []string `yaml:"tags"`
+	Region       string   `yaml:"region"`
+	Directory    string   `yaml:"directory"`
+	Verbose      bool     `yaml:"verbose"`
+	Pml          bool     `yaml:"pml"`
+	Feedback     bool     `yaml:"feedback"`
+	MaxWorkers   int      `yaml:"maxWorkers"`
+	ExcludeDir   string   `yaml:"excludeDir"`
+	TimeoutLimit int      `yaml:"timeoutLimit"`
+	Tags         []string `yaml:"tags"`
 }
 
-// Struct for Tags
-type Tags []string
-
-func (tags *Tags) String() string {
-	return fmt.Sprintf("%v", *tags)
+// Struct to represent the scan result
+type ScanResult struct {
+	ScannerVersion string `json:"scannerVersion"`
+	SchemaVersion  string `json:"schemaVersion"`
+	ScanResult     int    `json:"scanResult"`
+	ScanId         string `json:"scanId"`
+	ScanTimestamp  string `json:"scanTimestamp"`
+	FileName       string `json:"fileName"`
+	FoundMalwares  []struct {
+		FileName    string `json:"fileName"`
+		MalwareName string `json:"malwareName"`
+	} `json:"foundMalwares"`
+	FileSHA1   string `json:"fileSHA1"`
+	FileSHA256 string `json:"fileSHA256"`
 }
 
-func (tags *Tags) Set(value string) error {
-	*tags = append(*tags, strings.Split(value, ",")...)
-	if len(*tags) > 8 {
-		log.Fatalf("tags accepts up to 8 strings")
-	}
-	return nil
-}
-
-// Global Variables
+// Variables
 var (
 	apiKey           = flag.String("apiKey", "", "Vision One API Key. Can also use V1_FS_KEY env var")
-	configFile       = flag.String("config", "config.yaml", "Path to YAML configuration file")
-	region           string
-	directory        string
-	verbose          bool
-	pml              bool
-	feedback         bool
-	maxScanWorkers   int
-	internalAddress  string
-	internalTLS      bool
-	excludeDirFile   string
-	timeoutLimit     int
-	tags             Tags
-	excludedDirs     map[string]struct{}
+	region           = flag.String("region", "us-east-1", "Vision One Region")
+	directory        = flag.String("directory", "", "Path to Directory to scan")
+	verbose          = flag.Bool("verbose", false, "Log all scans to stdout")
+	pml              = flag.Bool("pml", false, "Enable predictive machine learning detection")
+	feedback         = flag.Bool("feedback", false, "Enable SPN feedback")
+	maxScanWorkers   = flag.Int("maxWorkers", 100, "Max number concurrent file scans Unlimited: -1")
+	excludeDirFile   = flag.String("exclude-dir", "", "Path to file containing directories to exclude from the scan")
+	timeoutLimit     = flag.Int("timeoutlimit", 10, "Timeout limit in seconds for scanning a file")
+	configFile       = flag.String("config", "", "Path to YAML configuration file")
+
+	excludedDirs     map[string]struct{} // Set to store directories to exclude from the scan
 	totalScanned     int64
 	filesWithMalware int64
 	filesClean       int64
 	waitGroup        sync.WaitGroup
-	client           *amaasclient.AmaasClient
+	mu               sync.Mutex
 	scanLog          *os.File
 	skippedFilesLog  *os.File
-	mu               sync.Mutex
+	client           *amaasclient.AmaasClient
+	tags             []string
 )
 
-// LoadConfig loads the YAML configuration file
-func LoadConfig(configFile string) (*Config, error) {
-	file, err := os.Open(configFile)
+func testAuth(client *amaasclient.AmaasClient) error {
+	_, err := client.ScanBuffer([]byte(""), "testAuth", nil)
+	return err
+}
+
+func loadExcludedDirs() error {
+	if *excludeDirFile == "" {
+		return nil
+	}
+
+	file, err := os.Open(*excludeDirFile)
 	if err != nil {
-		return nil, fmt.Errorf("error opening config file: %v", err)
+		return fmt.Errorf("Error opening exclusion file: %v", err)
 	}
 	defer file.Close()
 
-	var config Config
-	decoder := yaml.NewDecoder(file)
-	err = decoder.Decode(&config)
+	excludedDirs = make(map[string]struct{})
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		dir := strings.TrimSpace(scanner.Text())
+		if dir != "" {
+			excludedDirs[dir] = struct{}{}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("Error reading exclusion file: %v", err)
+	}
+
+	return nil
+}
+
+func loadConfig(filePath string) (*Config, error) {
+	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing config file: %v", err)
+		return nil, fmt.Errorf("Error opening config file: %v", err)
+	}
+	defer file.Close()
+
+	decoder := yaml.NewDecoder(file)
+	config := &Config{}
+	if err := decoder.Decode(config); err != nil {
+		return nil, fmt.Errorf("Error decoding config file: %v", err)
 	}
 
-	return &config, nil
+	return config, nil
 }
 
-// OverrideConfigWithFlags overrides YAML config with command-line flags
-func OverrideConfigWithFlags(config *Config) {
-	if *region != "" {
-		config.Region = *region
-	}
-	if *directory != "" {
-		config.Directory = *directory
-	}
-	if *verbose {
-		config.Verbose = *verbose
-	}
-	if *pml {
-		config.PML = *pml
-	}
-	if *feedback {
-		config.Feedback = *feedback
-	}
-	if *maxScanWorkers != 0 {
-		config.MaxScanWorkers = *maxScanWorkers
-	}
-	if *internalAddress != "" {
-		config.InternalAddress = *internalAddress
-	}
-	if !*internalTLS {
-		config.InternalTLS = *internalTLS
-	}
-	if *excludeDirFile != "" {
-		config.ExcludeDirFile = *excludeDirFile
-	}
-	if *timeoutLimit != 0 {
-		config.TimeoutLimit = *timeoutLimit
-	}
-}
-
-// Main Function
 func main() {
-	flag.Var(&tags, "tags", "Comma-separated tags (up to 8 strings)")
 	flag.Parse()
 
-	// Load YAML configuration
-	config, err := LoadConfig(*configFile)
+	if *configFile != "" {
+		config, err := loadConfig(*configFile)
+		if err != nil {
+			log.Fatalf("Error loading configuration: %v", err)
+		}
+
+		if config.Region != "" {
+			*region = config.Region
+		}
+		if config.Directory != "" {
+			*directory = config.Directory
+		}
+		*verbose = config.Verbose
+		*pml = config.Pml
+		*feedback = config.Feedback
+		*maxScanWorkers = config.MaxWorkers
+		if config.ExcludeDir != "" {
+			*excludeDirFile = config.ExcludeDir
+		}
+		if config.TimeoutLimit > 0 {
+			*timeoutLimit = config.TimeoutLimit
+		}
+		tags = config.Tags
+	}
+
+	if *apiKey == "" {
+		if key, found := os.LookupEnv("V1_FS_KEY"); found {
+			*apiKey = key
+		} else {
+			log.Fatal("API key is required. Use -apiKey or set V1_FS_KEY environment variable.")
+		}
+	}
+
+	if *directory == "" {
+		log.Fatal("Directory to scan is required. Use -directory flag.")
+	}
+
+	if err := loadExcludedDirs(); err != nil {
+		log.Fatalf("Error loading excluded directories: %v", err)
+	}
+
+	var err error
+	client, err = amaasclient.NewClient(*apiKey, *region)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		log.Fatalf("Error creating Vision One client: %v", err)
+	}
+	defer client.Destroy()
+
+	if *pml {
+		client.SetPMLEnable()
+	}
+	if *feedback {
+		client.SetFeedbackEnable()
 	}
 
-	// Override YAML config with command-line flags
-	OverrideConfigWithFlags(config)
-
-	// Assign configuration values to variables
-	region = config.Region
-	directory = config.Directory
-	verbose = config.Verbose
-	pml = config.PML
-	feedback = config.Feedback
-	maxScanWorkers = config.MaxScanWorkers
-	internalAddress = config.InternalAddress
-	internalTLS = config.InternalTLS
-	excludeDirFile = config.ExcludeDirFile
-	timeoutLimit = config.TimeoutLimit
-	tags = config.Tags
-
-	if verbose {
-		fmt.Printf("Effective Configuration: %+v\n", config)
+	if err := testAuth(client); err != nil {
+		log.Fatalf("Authentication failed: %v", err)
 	}
 
-	// Initialize logging
-	timestamp := time.Now().Format("01-02-2006T15:04")
-	LOG_FILE := fmt.Sprintf("%s.error.log", timestamp)
-	logFile, err := os.OpenFile(LOG_FILE, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		log.Panic(err)
-	}
-	defer logFile.Close()
-	log.SetOutput(logFile)
-	log.SetFlags(log.Lshortfile | log.LstdFlags)
-
-	// Initialize scan log file
-	scanLogFile := fmt.Sprintf("%s-Scan.log", timestamp)
-	scanLog, err = os.OpenFile(scanLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	logFileName := time.Now().Format("01-02-2006T15:04")
+	scanLog, err = os.OpenFile(fmt.Sprintf("%s-Scan.log", logFileName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		log.Fatalf("Error creating scan log file: %v", err)
 	}
 	defer scanLog.Close()
 
-	// Initialize channel for file scan concurrency
-	var scanFileChannel chan struct{}
-
-	if maxScanWorkers == -1 {
-		scanFileChannel = make(chan struct{})
-	} else {
-		scanFileChannel = make(chan struct{}, maxScanWorkers)
+	skippedFilesLog, err = os.OpenFile(fmt.Sprintf("%s-skipped_files.log", logFileName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatalf("Error creating skipped files log: %v", err)
 	}
+	defer skippedFilesLog.Close()
 
-	// Start scanning the initial directory
-	startTime := time.Now()
+	concurrencyLimit := make(chan struct{}, *maxScanWorkers)
+	start := time.Now()
 	waitGroup.Add(1)
-	go scanDirectory(client, directory, scanFileChannel, time.Duration(timeoutLimit)*time.Second)
-
-	// Wait for all goroutines to finish before exiting
+	go scanDirectory(*directory, time.Duration(*timeoutLimit)*time.Second, concurrencyLimit)
 	waitGroup.Wait()
 
-	// Calculate total scan time
-	timeTaken := time.Since(startTime)
-
-	// Write scan statistics to log
-	mu.Lock()
-	fmt.Fprintf(scanLog, "Total Scan Time: %s\nTotal Files Scanned: %d\nFiles with Malware: %d\nFiles Clean: %d\n",
-		timeTaken, atomic.LoadInt64(&totalScanned), atomic.LoadInt64(&filesWithMalware), atomic.LoadInt64(&filesClean))
-	mu.Unlock()
-
-	// Output the summary to the terminal
-	fmt.Println("\n--- Scan Summary ---")
-	fmt.Printf("Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
-	fmt.Printf("Files with Malware: %d\n", atomic.LoadInt64(&filesWithMalware))
-	fmt.Printf("Files Clean: %d\n", atomic.LoadInt64(&filesClean))
-	fmt.Printf("Total Scan Time: %s\n", timeTaken)
+	log.Printf("Total scan time: %v", time.Since(start))
 }
 
-// Function to recursively scan a directory
-func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileChannel chan struct{}, timeout time.Duration) {
+func scanDirectory(path string, timeout time.Duration, concurrencyLimit chan struct{}) {
 	defer waitGroup.Done()
 
-	// Normalize the directory path
-	normalizedDir := filepath.Clean(directory)
-
-	// Check for exclusions
-	for excludedDir := range excludedDirs {
-		if strings.HasPrefix(normalizedDir, excludedDir) {
-			if verbose {
-				log.Printf("Skipping excluded directory: %s\n", directory)
-			}
-			return
-		}
-	}
-
-	// Process files and directories
-	files, err := os.ReadDir(directory)
+	files, err := os.ReadDir(path)
 	if err != nil {
-		if verbose {
-			log.Printf("Error reading directory: %v\n", err)
-		}
+		log.Printf("Error reading directory %s: %v", path, err)
 		return
 	}
 
 	for _, file := range files {
-		fp := filepath.Join(directory, file.Name())
+		fullPath := filepath.Join(path, file.Name())
 		if file.IsDir() {
 			waitGroup.Add(1)
-			go scanDirectory(client, fp, scanFileChannel, timeout)
+			go scanDirectory(fullPath, timeout, concurrencyLimit)
 		} else {
 			waitGroup.Add(1)
-			go func(filePath string) {
-				scanFileChannel <- struct{}{}
-				if err := scanFile(client, filePath, timeout); err != nil && verbose {
-					log.Printf("Error scanning file %s: %v\n", filePath, err)
+			go func(fp string) {
+				defer waitGroup.Done()
+				concurrencyLimit <- struct{}{}
+				if err := scanFile(fp, timeout); err != nil {
+					log.Printf("Error scanning file %s: %v", fp, err)
 				}
-				<-scanFileChannel
-				waitGroup.Done()
-			}(fp)
+				<-concurrencyLimit
+			}(fullPath)
 		}
 	}
 }
 
-// Function to scan a file
-func scanFile(client *amaasclient.AmaasClient, filePath string, timeout time.Duration) error {
+func scanFile(filePath string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	start := time.Now()
+	scanErrChan := make(chan error, 1)
+	go func() {
+		_, err := client.ScanFile(filePath, tags)
+		scanErrChan <- err
+	}()
 
-	rawResult, err := client.ScanFile(filePath, tags)
-	if err != nil {
-		log.Printf("Error scanning file %s: %v\n", filePath, err)
-		return err
-	}
-
-	var result ScanResult
-	if err := json.Unmarshal([]byte(rawResult), &result); err != nil {
-		log.Printf("Error unmarshaling result: %v\n", err)
-		return err
-	}
-
-	// Log results
-	mu.Lock()
-	fmt.Fprintf(scanLog, "Scanned: %s in %v\n", filePath, time.Since(start))
-	mu.Unlock()
-
-	return nil
-}
+	select {
+	case <-ctx.Done():
+		logSkippedFile(filePath,
