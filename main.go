@@ -14,8 +14,6 @@ import (
 	"bufio"
 	"gopkg.in/yaml.v3"
 
-	"gopkg.in/yaml.v3"
-
 	amaasclient "github.com/trendmicro/tm-v1-fs-golang-sdk"
 )
 
