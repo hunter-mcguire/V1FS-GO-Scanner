@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"bufio"
 	"encoding/json"
 	"flag"
@@ -71,6 +72,7 @@ var (
 	client          *amaasclient.AmaasClient // FS Client
 	mu              sync.Mutex               // Mutex for thread-safe access to log file
 	scanLog         *os.File                 // File to log scanned files and results
+	timeoutLimit = flag.Int("timeoutlimit", 10, "Timeout limit in seconds for scanning a file")
 )
 
 func testAuth(client *amaasclient.AmaasClient) error {
