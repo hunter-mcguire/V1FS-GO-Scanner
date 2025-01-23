@@ -242,120 +242,105 @@ defer client.Destroy()
 }
 
 func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileChannel chan struct{}, timeout time.Duration) {
-    defer waitGroup.Done()
+	defer waitGroup.Done()
+	normalizedDir := filepath.Clean(directory)
+	for excludedDir := range excludedDirs {
+		if strings.HasPrefix(normalizedDir, filepath.Clean(excludedDir)) {
+			if *verbose {
+				log.Printf("Skipping excluded directory\n")
+			}
+			return
+		}
+	}
 
-    normalizedDir := filepath.Clean(directory)
+	files, err := os.ReadDir(directory)
+	if err != nil {
+		if *verbose {
+			log.Printf("Error reading directory: %v\n", err)
+		}
+		return
+	}
 
-    // Check exclusions
-    for excludedDir := range excludedDirs {
-        if strings.HasPrefix(normalizedDir, filepath.Clean(excludedDir)) {
-            if *verbose {
-                infoLogger.Printf("Skipping excluded directory: %s\n", directory)
-            }
-            return
-        }
-    }
-
-    // Log sanitized directory action (informational)
-    if *verbose {
-        infoLogger.Printf("Descending into directory: %s\n", directory)
-    }
-
-    files, err := os.ReadDir(directory)
-    if err != nil {
-        errorLogger.Printf("Error reading directory: %s, Error: %v\n", directory, err) // Log as an error
-        return
-    }
-
-    for _, f := range files {
-        fp := filepath.Join(directory, f.Name())
-        if f.IsDir() {
-            waitGroup.Add(1)
-            go scanDirectory(client, fp, scanFileChannel, timeout)
-        } else {
-            waitGroup.Add(1)
-            go func(filePath string) {
-                scanFileChannel <- struct{}{}
-                if err := scanFile(client, filePath, timeout); err != nil {
-                    errorLogger.Printf("Error scanning file: %s, Error: %v\n", filePath, err) // Log as an error
-                }
-                <-scanFileChannel
-                waitGroup.Done()
-            }(fp)
-        }
-    }
+	for _, f := range files {
+		fp := filepath.Join(directory, f.Name())
+		if f.IsDir() {
+			waitGroup.Add(1)
+			go scanDirectory(client, fp, scanFileChannel, timeout)
+		} else {
+			waitGroup.Add(1)
+			go func(filePath string) {
+				scanFileChannel <- struct{}{}
+				if err := scanFile(client, filePath, timeout); err != nil && *verbose {
+					log.Printf("Error scanning file: %v\n", err)
+				}
+				<-scanFileChannel
+				waitGroup.Done()
+			}(fp)
+		}
+	}
 }
 
 func scanFile(client *amaasclient.AmaasClient, filePath string, timeout time.Duration) error {
-    start := time.Now()
+	start := time.Now()
 
-    file, err := os.Open(filePath)
-    if err != nil {
-        errorLogger.Printf("Failed to open file: %s, Error: %v\n", filePath, err)
-        return err
-    }
-    fileInfo, err := file.Stat()
-    file.Close()
-    if err != nil {
-        errorLogger.Printf("Failed to stat file: %s, Error: %v\n", filePath, err)
-        return err
-    }
+	file, err := os.Open(filePath)
+	if err != nil {
+		logSkippedFile(filePath, err)
+		return err
+	}
+	fileInfo, err := file.Stat()
+	file.Close()
+	if err != nil {
+		logSkippedFile(filePath, err)
+		return err
+	}
 
-    // Skip special files
-    if fileInfo.Mode().IsDir() || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.Mode()&os.ModeNamedPipe != 0 || fileInfo.Mode()&os.ModeSocket != 0 {
-        return nil
-    }
+	if fileInfo.Mode().IsDir() || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.Mode()&os.ModeNamedPipe != 0 || fileInfo.Mode()&os.ModeSocket != 0 {
+		return nil
+	}
 
-    ctx, cancel := context.WithTimeout(context.Background(), timeout)
-    defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 
-    scanErrChan := make(chan error, 1)
+	scanErrChan := make(chan error, 1)
+	go func() {
+		rawResult, err := client.ScanFile(filePath, tags)
+		if err == nil {
+			var result ScanResult
+			err := json.Unmarshal([]byte(rawResult), &result)
+			if err == nil {
+				if len(result.FoundMalwares) > 0 {
+					atomic.AddInt64(&filesWithMalware, 1)
+				} else {
+					atomic.AddInt64(&filesClean, 1)
+				}
 
-    go func() {
-        _, err := client.ScanFile(filePath, tags)
-        scanErrChan <- err
-    }()
+				mu.Lock()
+				fmt.Fprintf(scanLog, "%s\n", rawResult)
+				mu.Unlock()
+			}
+		}
+		scanErrChan <- err
+	}()
 
-    select {
-    case <-ctx.Done():
-        errorLogger.Printf("File scan timed out: %s\n", filePath)
-        return ctx.Err()
-    case scanErr := <-scanErrChan:
-        if scanErr != nil {
-            errorLogger.Printf("Failed to scan file: %s, Error: %v\n", filePath, scanErr)
-            return scanErr
-        }
-    }
+	select {
+	case <-ctx.Done():
+		log.Printf("File scan timed out: %s\n", filePath)
+		logSkippedFile(filePath, fmt.Errorf("scan timed out"))
+		return ctx.Err()
+	case scanErr := <-scanErrChan:
+		if scanErr != nil {
+			log.Printf("Error scanning file: %s, Error: %v\n", filePath, scanErr)
+			logSkippedFile(filePath, scanErr)
+			return scanErr
+		}
+	}
 
-    // Log success (optional, but not in the error log)
-    if *verbose {
-        infoLogger.Printf("Scanned: %s, Duration: %s\n", filePath, time.Since(start))
-    }
-    return nil
-}
-
-    // Handle timeout or scan completion
-    select {
-    case <-ctx.Done():
-        log.Printf("File scan timed out: %s\n", filePath)
-        logSkippedFile(filePath, fmt.Errorf("scan timed out"))
-        return ctx.Err()
-    case scanErr := <-scanErrChan:
-        if scanErr != nil {
-            logSkippedFile(filePath, scanErr)
-            return scanErr
-        }
-    }
-
-    // Increment scanned file counter
-    atomic.AddInt64(&totalScanned, 1)
-
-    // Log scan completion
-    mu.Lock()
-    fmt.Fprintf(scanLog, "Scanned: %s, Duration: %s\n", filePath, time.Since(start))
-    mu.Unlock()
-
-    return nil
+	atomic.AddInt64(&totalScanned, 1)
+	mu.Lock()
+	fmt.Fprintf(scanLog, "Scanned: %s, Duration: %s\n", filePath, time.Since(start))
+	mu.Unlock()
+	return nil
 }
 
 func logSkippedFile(filePath string, err error) {
