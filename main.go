@@ -24,6 +24,7 @@ type Config struct {
 	Directory      string   `yaml:"directory"`
 	Verbose        bool     `yaml:"verbose"`
 	PML            bool     `yaml:"pml"`
+	Digest         bool     `yaml:"digest"`
 	Feedback       bool     `yaml:"feedback"`
 	MaxWorkers     int      `yaml:"maxWorkers"`
 	ExcludeDirFile string   `yaml:"excludeDirFile"`
