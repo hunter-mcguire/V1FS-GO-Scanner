@@ -63,6 +63,7 @@ var (
 	internal_tls     = flag.Bool("internal_tls", true, "Use TLS for internal Service Gateway")
 	excludeDirFile = flag.String("exclude-dir", "", "Path to file containing directories to exclude from the scan")
 	timeoutLimit = flag.Int("timeoutlimit", 10, "Timeout limit in seconds for scanning a file")
+    digest           = flag.Bool("digest", true, "Enable or disable digest calculation")
     
 	excludedDirs   map[string]struct{} // Set to store directories to exclude from the scan
 	totalScanned    int64                    // Counter for total files scanned, ensure thread-safe operations
@@ -160,13 +161,40 @@ func main() {
 		}
 	}
 
-	if *pml {
-		client.SetPMLEnable()
-	}
+    if *digest {
+        client.SetDigestCalculation(true) // Enable digest calculation
+        if *verbose {
+            log.Println("Digest calculation is enabled.")
+        }
+    } else {
+        client.SetDigestCalculation(false) // Disable digest calculation
+        if *verbose {
+            log.Println("Digest calculation is disabled.")
+        }
+    }
 
-	if *feedback {
-		client.SetFeedbackEnable()
-	}
+    if *pml {
+        client.SetPMLEnable() // Enable PML if the flag is true
+        if *verbose {
+            log.Println("Predictive Machine Learning (PML) is enabled.")
+        }
+    } else {
+        if *verbose {
+            log.Println("Predictive Machine Learning (PML) is disabled.")
+        }
+    }
+    
+    // Enable or disable Feedback based on the flag
+    if *feedback {
+        client.SetFeedbackEnable() // Enable Feedback if the flag is true
+        if *verbose {
+            log.Println("SPN Feedback is enabled.")
+        }
+    } else {
+        if *verbose {
+            log.Println("SPN Feedback is disabled.")
+        }
+    }
 
 	authTest := testAuth(client)
 
