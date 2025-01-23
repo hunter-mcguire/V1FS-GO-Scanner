@@ -173,6 +173,10 @@ func scanDirectory(directory string, timeout time.Duration, maxWorkers int) {
 	for _, file := range files {
 		filePath := filepath.Join(directory, file.Name())
 		if file.IsDir() {
+			if _, excluded := excludedDirs[filePath]; excluded {
+				log.Printf("Skipping excluded directory: %s", filePath)
+				continue
+			}
 			waitGroup.Add(1)
 			go scanDirectory(filePath, timeout, maxWorkers)
 		} else {
