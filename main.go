@@ -62,6 +62,7 @@ var (
 	internal_address = flag.String("internal_address", "", "Internal Service Gateway Address")
 	internal_tls     = flag.Bool("internal_tls", true, "Use TLS for internal Service Gateway")
 	excludeDirFile = flag.String("exclude-dir", "", "Path to file containing directories to exclude from the scan")
+	timeoutLimit = flag.Int("timeoutlimit", 10, "Timeout limit in seconds for scanning a file")
     
 	excludedDirs   map[string]struct{} // Set to store directories to exclude from the scan
 	totalScanned    int64                    // Counter for total files scanned, ensure thread-safe operations
@@ -72,7 +73,6 @@ var (
 	client          *amaasclient.AmaasClient // FS Client
 	mu              sync.Mutex               // Mutex for thread-safe access to log file
 	scanLog         *os.File                 // File to log scanned files and results
-	timeoutLimit = flag.Int("timeoutlimit", 10, "Timeout limit in seconds for scanning a file")
 )
 
 func testAuth(client *amaasclient.AmaasClient) error {
