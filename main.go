@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -55,7 +57,7 @@ type Progress struct {
 	filesProcessed atomic.Int64
 	bytesProcessed atomic.Int64
 	startTime      time.Time
-	mu            sync.Mutex
+	mu            sync.RWMutex
 }
 
 // ScanWorkerPool manages scan workers
@@ -63,6 +65,7 @@ type ScanWorkerPool struct {
 	jobs    chan string
 	results chan error
 	wg      *sync.WaitGroup
+	size    int
 }
 
 // IOThrottler controls I/O operations
@@ -74,8 +77,9 @@ type IOThrottler struct {
 // MemoryMonitor tracks memory usage
 type MemoryMonitor struct {
 	maxMemoryMB int64
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	paused      bool
+	threshold   float64
 }
 
 // ScanCheckpoint represents a scanning checkpoint
@@ -104,6 +108,7 @@ var (
 	excludeDirFile   = flag.String("exclude-dir", "", "Path to file containing directories to exclude")
 	internal_address = flag.String("internal_address", "", "Internal Service Gateway Address")
 	internal_tls     = flag.Bool("internal_tls", true, "Use TLS for internal Service Gateway")
+	batchSize        = flag.Int("batchSize", 50, "Number of files to process in a batch")
 
 	// Internal variables
 	excludedDirs     map[string]struct{}
@@ -113,41 +118,58 @@ var (
 	waitGroup        sync.WaitGroup
 	tags             Tags
 	client           *amaasclient.AmaasClient
-	mu              sync.Mutex
-	scanLog         *os.File
-	errorLog        *log.Logger
-	verboseLog      *log.Logger
+	mu               sync.RWMutex
+	scanLog          *os.File
+	errorLog         *log.Logger
+	verboseLog       *log.Logger
+	skipExtRegex     *regexp.Regexp
+	skipExtOnce      sync.Once
 )
-
-func (p *Progress) PrintStatus() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	elapsed := time.Since(p.startTime)
-	bytesPerSec := float64(p.bytesProcessed.Load()) / elapsed.Seconds()
-
-	fmt.Printf("\rProcessed: %d files, %.2f GB, %.2f MB/s, Current: %s",
-		p.filesProcessed.Load(),
-		float64(p.bytesProcessed.Load())/1e9,
-		bytesPerSec/1e6,
-		p.currentDir)
-}
 
 func NewScanWorkerPool(numWorkers int) *ScanWorkerPool {
 	return &ScanWorkerPool{
-		jobs:    make(chan string, numWorkers*2),
-		results: make(chan error, numWorkers*2),
+		jobs:    make(chan string, numWorkers),
+		results: make(chan error, numWorkers),
 		wg:      &sync.WaitGroup{},
+		size:    numWorkers,
 	}
 }
 
 func (p *ScanWorkerPool) Start(client *amaasclient.AmaasClient, throttler *IOThrottler, memMonitor *MemoryMonitor) {
-	for i := 0; i < cap(p.jobs); i++ {
+	for i := 0; i < p.size; i++ {
 		go func() {
-			for filePath := range p.jobs {
-				err := scanFile(client, filePath, throttler, memMonitor)
-				p.results <- err
-				p.wg.Done()
+			for {
+				// Process files in batches
+				var files []string
+				
+				// Get first file
+				filePath, ok := <-p.jobs
+				if !ok {
+					return
+				}
+				files = append(files, filePath)
+
+				// Try to collect more files up to batch size
+				collecting := true
+				for len(files) < *batchSize && collecting {
+					select {
+					case nextFile, ok := <-p.jobs:
+						if !ok {
+							collecting = false
+							break
+						}
+						files = append(files, nextFile)
+					default:
+						collecting = false
+					}
+				}
+
+				// Process the batch
+				for _, f := range files {
+					err := scanFile(client, f, throttler, memMonitor)
+					p.results <- err
+					p.wg.Done()
+				}
 			}
 		}()
 	}
@@ -171,6 +193,7 @@ func (t *IOThrottler) Acquire() {
 func NewMemoryMonitor(maxMemoryMB int64) *MemoryMonitor {
 	mm := &MemoryMonitor{
 		maxMemoryMB: maxMemoryMB,
+		threshold:   0.8, // 80% threshold
 	}
 	go mm.monitor()
 	return mm
@@ -185,12 +208,13 @@ func (m *MemoryMonitor) monitor() {
 		runtime.ReadMemStats(&memStats)
 
 		memoryUsageMB := memStats.Alloc / 1024 / 1024
+		threshold := float64(m.maxMemoryMB) * m.threshold
 
 		m.mu.Lock()
-		if memoryUsageMB > uint64(m.maxMemoryMB) && !m.paused {
+		if float64(memoryUsageMB) > threshold && !m.paused {
 			m.paused = true
 			logError("Memory usage high (%dMB), pausing new scans", memoryUsageMB)
-		} else if memoryUsageMB < uint64(m.maxMemoryMB)*80/100 && m.paused {
+		} else if float64(memoryUsageMB) < threshold*0.8 && m.paused {
 			m.paused = false
 			logVerbose("Memory usage normal (%dMB), resuming scans", memoryUsageMB)
 		}
@@ -199,134 +223,101 @@ func (m *MemoryMonitor) monitor() {
 }
 
 func (m *MemoryMonitor) ShouldPause() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.paused
 }
 
-func initializeLogging() {
-	timestamp := time.Now().Format("01-02-2006T15:04")
-	errorLogFile := fmt.Sprintf("%s.error.log", timestamp)
-	errorFile, err := os.OpenFile(errorLogFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
-	if err != nil {
-		log.Fatal(err)
-	}
-	errorLog = log.New(errorFile, "", log.Lshortfile|log.LstdFlags)
-
-	if *verbose {
-		verboseLog = log.New(os.Stdout, "", log.Lshortfile|log.LstdFlags)
-	}
-
-	scanLogFile := fmt.Sprintf("%s-Scan.log", timestamp)
-	scanLog, err = os.OpenFile(scanLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		errorLog.Fatalf("Error creating scan log file: %v", err)
-	}
-}
-
-func logError(format string, v ...interface{}) {
-	if errorLog != nil {
-		errorLog.Printf(format, v...)
-	}
-}
-
-func logVerbose(format string, v ...interface{}) {
-	if *verbose && verboseLog != nil {
-		verboseLog.Printf(format, v...)
-	}
-}
-
 func scanDirectory(client *amaasclient.AmaasClient, directory string, pool *ScanWorkerPool, progress *Progress, throttler *IOThrottler, memMonitor *MemoryMonitor) error {
-	checkpoint, _ := loadCheckpoint()
-	if checkpoint != nil {
-		atomic.StoreInt64(&totalScanned, checkpoint.TotalScanned)
+	filesChan := make(chan string, 1000)
+	errChan := make(chan error, 1)
+
+	// Start concurrent file collection
+	go func() {
+		err := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				logError("Error accessing path %s: %v", path, err)
+				return nil
+			}
+
+			progress.mu.Lock()
+			progress.currentDir = filepath.Dir(path)
+			progress.mu.Unlock()
+
+			if info.IsDir() {
+				if shouldSkipDirectory(path) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+
+			if shouldScanFile(path, info) {
+				filesChan <- path
+			}
+
+			return nil
+		})
+		close(filesChan)
+		if err != nil {
+			errChan <- err
+		}
+	}()
+
+	// Process files in batches
+	var batch []string
+	for filePath := range filesChan {
+		batch = append(batch, filePath)
+
+		if len(batch) >= *batchSize {
+			processBatch(batch, pool, progress)
+			batch = batch[:0]
+		}
 	}
 
-	go periodicCheckpoint(progress)
+	// Process remaining files
+	if len(batch) > 0 {
+		processBatch(batch, pool, progress)
+	}
 
-	logVerbose("Starting scan of directory: %s", directory)
-
-	return filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			logError("Error accessing path %s: %v", path, err)
-			return nil
-		}
-
-		progress.mu.Lock()
-		progress.currentDir = filepath.Dir(path)
-		progress.mu.Unlock()
-
-		if info.IsDir() {
-			logVerbose("Checking directory: %s", path)
-			if shouldSkipDirectory(path) {
-				logVerbose("Skipping excluded directory: %s", path)
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if shouldScanFile(path, info) {
-			logVerbose("Queueing file for scan: %s", path)
-			pool.wg.Add(1)
-			select {
-			case pool.jobs <- path:
-				atomic.AddInt64(&totalScanned, 1)
-				progress.bytesProcessed.Add(info.Size())
-				progress.filesProcessed.Add(1)
-			default:
-				if err := scanFile(client, path, throttler, memMonitor); err != nil {
-					logError("Error scanning file %s: %v", path, err)
-				}
-				pool.wg.Done()
-			}
-		} else {
-			logVerbose("Skipping file due to filters: %s", path)
-		}
-
+	select {
+	case err := <-errChan:
+		return err
+	default:
 		return nil
-	})
+	}
+}
+
+func processBatch(batch []string, pool *ScanWorkerPool, progress *Progress) {
+	for _, filePath := range batch {
+		pool.wg.Add(1)
+		pool.jobs <- filePath
+		progress.filesProcessed.Add(1)
+	}
 }
 
 func scanFile(client *amaasclient.AmaasClient, filePath string, throttler *IOThrottler, memMonitor *MemoryMonitor) error {
-	logVerbose("Starting scan of file: %s", filePath)
-
 	for memMonitor.ShouldPause() {
-		logVerbose("Waiting for memory usage to decrease before scanning %s", filePath)
 		time.Sleep(time.Second)
 	}
 
 	throttler.Acquire()
-
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		logError("Error accessing file %s: %v", filePath, err)
-		return err
-	}
-
-	if fileInfo.IsDir() || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.Mode()&os.ModeNamedPipe != 0 {
-		logVerbose("Skipping non-regular file: %s", filePath)
-		return nil
-	}
 
 	const maxRetries = 3
 	var lastErr error
 
 	for retry := 0; retry < maxRetries; retry++ {
 		if retry > 0 {
-			logVerbose("Retry %d for file: %s", retry, filePath)
 			time.Sleep(time.Duration(retry) * time.Second)
 		}
 
 		if err := scanFileOnce(client, filePath); err != nil {
 			lastErr = err
-			logError("Scan attempt %d failed for %s: %v", retry+1, filePath, err)
 			if err != context.DeadlineExceeded {
 				return err
 			}
 			continue
 		}
-		
-		logVerbose("Successfully scanned file: %s", filePath)
+
 		atomic.AddInt64(&totalScanned, 1)
 		return nil
 	}
@@ -369,23 +360,123 @@ func shouldSkipDirectory(path string) bool {
 }
 
 func shouldScanFile(path string, info os.FileInfo) bool {
-	if info.Size() > *maxFileSize || info.Size() < *minFileSize {
+	skipExtOnce.Do(func() {
+		extensions := strings.Split(*skipExtensions, ",")
+		for i, ext := range extensions {
+			extensions[i] = regexp.QuoteMeta(strings.TrimSpace(ext))
+		}
+		pattern := fmt.Sprintf("(?i)\\.((%s))$", strings.Join(extensions, ")|("))
+		skipExtRegex = regexp.MustCompile(pattern)
+	})
+
+	if info.Size() < *minFileSize || info.Size() > *maxFileSize {
 		return false
 	}
 
-	ext := strings.ToLower(filepath.Ext(path))
-	for _, skipExt := range strings.Split(*skipExtensions, ",") {
-		if ext == strings.TrimSpace(skipExt) {
-			return false
-		}
-	}
-
-	return true
+	return !skipExtRegex.MatchString(path)
 }
 
-func testAuth(client *amaasclient.AmaasClient) error {
-	_, err := client.ScanBuffer([]byte(""), "testAuth", nil)
-	return err
+func initializeLogging() {
+	timestamp := time.Now().Format("01-02-2006T15:04")
+	errorLogFile := fmt.Sprintf("%s.error.log", timestamp)
+	errorFile, err := os.OpenFile(errorLogFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	errorLog = log.New(errorFile, "", log.Lshortfile|log.LstdFlags)
+
+	if *verbose {
+		verboseLog = log.New(os.Stdout, "", log.Lshortfile|log.LstdFlags)
+	}
+
+	scanLogFile := fmt.Sprintf("%s-Scan.log", timestamp)
+	scanLog, err = os.OpenFile(scanLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		errorLog.Fatalf("Error creating scan log file: %v", err)
+	}
+}
+
+func logError(format string, v ...interface{}) {
+	if errorLog != nil {
+		errorLog.Printf(format, v...)
+	}
+}
+
+func logVerbose(format string, v ...interface{}) {
+	if *verbose && verboseLog != nil {
+		verboseLog.Printf(format, v...)
+	}
+}
+
+func periodicCheckpoint(progress *Progress) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+
+	for range ticker.C {
+		buf.Reset()
+		checkpoint := ScanCheckpoint{
+			LastScannedPath: progress.currentDir,
+			TotalScanned:    atomic.LoadInt64(&totalScanned),
+			Timestamp:       time.Now(),
+		}
+
+		if err := encoder.Encode(&checkpoint); err != nil {
+			logError("Error encoding checkpoint: %v", err)
+			continue
+		}
+
+		tempFile := "scan_checkpoint.json.tmp"
+		if err := os.Rename(tempFile, "scan_checkpoint.json"); err != nil {
+			logError("Error saving checkpoint: %v", err)
+			os.Remove(tempFile)
+		}
+	}
+}
+
+func validateAndGetApiKey() string {
+	if k, exists := os.LookupEnv("V1_FS_KEY"); exists {
+		return k
+	}
+	if *apiKey == "" {
+		flag.PrintDefaults()
+		log.Fatal("Use V1_FS_KEY env var or -apiKey parameter")
+	}
+	return *apiKey
+}
+
+func validateDirectory() {
+	if *directory == "" {
+		flag.PrintDefaults()
+		log.Fatal("Missing required argument: -directory")
+	}
+}
+
+func initializeClient(apiKey string) {
+	var err error
+	if *internal_address != "" {
+		client, err = amaasclient.NewClientInternal(apiKey, *internal_address, *internal_tls)
+	} else {
+		client, err = amaasclient.NewClient(apiKey, *region)
+	}
+	if err != nil {
+		log.Fatalf("Error creating client: %v", err)
+	}
+
+	if *pml {
+		client.SetPMLEnable()
+		logVerbose("PML scanning enabled")
+	}
+	if *feedback {
+		client.SetFeedbackEnable()
+		logVerbose("Feedback enabled")
+	}
+
+	if err := testAuth(client); err != nil {
+		log.Fatal("Bad Credentials. Check API KEY and role permissions")
+	}
 }
 
 func loadExcludedDirs() error {
@@ -411,161 +502,104 @@ func loadExcludedDirs() error {
 	return scanner.Err()
 }
 
-func loadCheckpoint() (*ScanCheckpoint, error) {
-    data, err := os.ReadFile("scan_checkpoint.json")
-    if err != nil {
-        if os.IsNotExist(err) {
-            return nil, nil
-        }
-        return nil, err
-    }
-
-    var checkpoint ScanCheckpoint
-    err = json.Unmarshal(data, &checkpoint)
-    return &checkpoint, err
-}
-
-func saveCheckpoint(checkpoint ScanCheckpoint) error {
-    data, err := json.Marshal(checkpoint)
-    if err != nil {
-        return err
-    }
-    return os.WriteFile("scan_checkpoint.json", data, 0644)
-}
-
-func periodicCheckpoint(progress *Progress) {
-    ticker := time.NewTicker(5 * time.Minute)
-    defer ticker.Stop()
-
-    for range ticker.C {
-        checkpoint := ScanCheckpoint{
-            LastScannedPath: progress.currentDir,
-            TotalScanned:    atomic.LoadInt64(&totalScanned),
-            Timestamp:       time.Now(),
-        }
-        if err := saveCheckpoint(checkpoint); err != nil {
-            logError("Error saving checkpoint: %v", err)
-        }
-    }
-}
-
-func validateAndGetApiKey() string {
-    if k, exists := os.LookupEnv("V1_FS_KEY"); exists {
-        return k
-    }
-    if *apiKey == "" {
-        flag.PrintDefaults()
-        log.Fatal("Use V1_FS_KEY env var or -apiKey parameter")
-    }
-    return *apiKey
-}
-
-func validateDirectory() {
-    if *directory == "" {
-        flag.PrintDefaults()
-        log.Fatal("Missing required argument: -directory")
-    }
-}
-
-func initializeClient(apiKey string) {
-    var err error
-    if *internal_address != "" {
-        client, err = amaasclient.NewClientInternal(apiKey, *internal_address, *internal_tls)
-    } else {
-        client, err = amaasclient.NewClient(apiKey, *region)
-    }
-    if err != nil {
-        log.Fatalf("Error creating client: %v", err)
-    }
-
-    if *pml {
-        client.SetPMLEnable()
-        logVerbose("PML scanning enabled")
-    }
-    if *feedback {
-        client.SetFeedbackEnable()
-        logVerbose("Feedback enabled")
-    }
-
-    if err := testAuth(client); err != nil {
-        log.Fatal("Bad Credentials. Check API KEY and role permissions")
-    }
-}
-
 func reportProgress(progress *Progress) {
-    ticker := time.NewTicker(5 * time.Second)
-    defer ticker.Stop()
-    for range ticker.C {
-        progress.PrintStatus()
-    }
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		progress.PrintStatus()
+	}
+}
+
+func (p *Progress) PrintStatus() {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	elapsed := time.Since(p.startTime)
+	bytesPerSec := float64(p.bytesProcessed.Load()) / elapsed.Seconds()
+
+	fmt.Printf("\rProcessed: %d files, %.2f GB, %.2f MB/s, Current: %s",
+		p.filesProcessed.Load(),
+		float64(p.bytesProcessed.Load())/1e9,
+		bytesPerSec/1e6,
+		p.currentDir)
 }
 
 func printSummary(startTime time.Time) {
-    timeTaken := time.Since(startTime)
-    
-    mu.Lock()
-    fmt.Fprintf(scanLog, "\n--- Final Scan Summary ---\n")
-    fmt.Fprintf(scanLog, "Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
-    fmt.Fprintf(scanLog, "Files with Malware: %d\n", atomic.LoadInt64(&filesWithMalware))
-    fmt.Fprintf(scanLog, "Files Clean: %d\n", atomic.LoadInt64(&filesClean))
-    fmt.Fprintf(scanLog, "Total Scan Time: %s\n", timeTaken)
-    mu.Unlock()
+	timeTaken := time.Since(startTime)
+	
+	mu.Lock()
+	fmt.Fprintf(scanLog, "\n--- Final Scan Summary ---\n")
+	fmt.Fprintf(scanLog, "Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
+	fmt.Fprintf(scanLog, "Files with Malware: %d\n", atomic.LoadInt64(&filesWithMalware))
+	fmt.Fprintf(scanLog, "Files Clean: %d\n", atomic.LoadInt64(&filesClean))
+	fmt.Fprintf(scanLog, "Total Scan Time: %s\n", timeTaken)
+	mu.Unlock()
 
-    fmt.Println("\n--- Final Scan Summary ---")
-    fmt.Printf("Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
-    fmt.Printf("Files with Malware: %d\n", atomic.LoadInt64(&filesWithMalware))
-    fmt.Printf("Files Clean: %d\n", atomic.LoadInt64(&filesClean))
-    fmt.Printf("Total Scan Time: %s\n", timeTaken)
+	fmt.Println("\n--- Final Scan Summary ---")
+	fmt.Printf("Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
+	fmt.Printf("Files with Malware: %d\n", atomic.LoadInt64(&filesWithMalware))
+	fmt.Printf("Files Clean: %d\n", atomic.LoadInt64(&filesClean))
+	fmt.Printf("Total Scan Time: %s\n", timeTaken)
+}
+
+func testAuth(client *amaasclient.AmaasClient) error {
+	_, err := client.ScanBuffer([]byte(""), "testAuth", nil)
+	return err
 }
 
 func main() {
-    // Parse command-line flags
-    flag.Var(&tags, "tags", "Up to 8 strings separated by commas")
-    flag.Parse()
+	// Parse command-line flags
+	flag.Var(&tags, "tags", "Up to 8 strings separated by commas")
+	flag.Parse()
 
-    // Validate required arguments
-    v1ApiKey := validateAndGetApiKey()
-    validateDirectory()
+	// Validate required arguments
+	v1ApiKey := validateAndGetApiKey()
+	validateDirectory()
 
-    // Initialize components
-    initializeLogging()
-    defer scanLog.Close()
+	// Initialize components
+	initializeLogging()
+	defer scanLog.Close()
 
-    // Load exclusion directories
-    if err := loadExcludedDirs(); err != nil {
-        logError("Error loading exclusion directories: %v", err)
-        os.Exit(1)
-    }
+	// Load exclusion directories
+	if err := loadExcludedDirs(); err != nil {
+		logError("Error loading exclusion directories: %v", err)
+		os.Exit(1)
+	}
 
-    // Initialize client
-    initializeClient(v1ApiKey)
-    defer client.Destroy()
+	// Initialize client
+	initializeClient(v1ApiKey)
+	defer client.Destroy()
 
-    // Initialize scanning components
-    progress := &Progress{startTime: time.Now()}
-    memMonitor := NewMemoryMonitor(*maxMemoryMB)
-    ioThrottler := NewIOThrottler(*ioThrottle)
-    pool := NewScanWorkerPool(*maxScanWorkers)
+	// Initialize scanning components
+	progress := &Progress{startTime: time.Now()}
+	memMonitor := NewMemoryMonitor(*maxMemoryMB)
+	ioThrottler := NewIOThrottler(*ioThrottle)
+	pool := NewScanWorkerPool(*maxScanWorkers)
 
-    // Start progress reporting
-    go reportProgress(progress)
+	// Start progress reporting
+	go reportProgress(progress)
 
-    // Start scanning
-    startTime := time.Now()
-    pool.Start(client, ioThrottler, memMonitor)
+	// Start scanning
+	startTime := time.Now()
+	pool.Start(client, ioThrottler, memMonitor)
 
-    // Start directory scanning
-    waitGroup.Add(1)
-    err := scanDirectory(client, *directory, pool, progress, ioThrottler, memMonitor)
-    if err != nil {
-        logError("Error scanning directory: %v", err)
-        os.Exit(1)
-    }
+	// Start directory scanning
+	waitGroup.Add(1)
+	err := scanDirectory(client, *directory, pool, progress, ioThrottler, memMonitor)
+	if err != nil {
+		logError("Error scanning directory: %v", err)
+		os.Exit(1)
+	}
 
-    // Wait for completion
-    close(pool.jobs)
-    pool.wg.Wait()
+	// Wait for completion
+	close(pool.jobs)
+	pool.wg.Wait()
 
-    // Print final summary
-    printSummary(startTime)
-}
+	// Print final summary
+	printSummary(startTime)
+}WriteFile(tempFile, buf.Bytes(), 0644); err != nil {
+			logError("Error writing checkpoint: %v", err)
+			continue
+		}
+
+		if err := os.
