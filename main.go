@@ -58,6 +58,7 @@ type Progress struct {
 	bytesProcessed atomic.Int64
 	startTime      time.Time
 	mu            sync.RWMutex
+	lastUpdate    time.Time
 }
 
 // ScanWorkerPool manages scan workers
@@ -103,12 +104,13 @@ var (
 	maxMemoryMB      = flag.Int64("maxMemoryMB", 1024, "Maximum memory usage in MB")
 	maxFileSize      = flag.Int64("maxFileSize", 500*1024*1024, "Max file size to scan in bytes")
 	minFileSize      = flag.Int64("minFileSize", 1024, "Min file size to scan in bytes")
-	skipExtensions   = flag.String("skipExt", ".iso,.vmdk,.vdi,.dll", "Comma-separated list of extensions to skip")
+	skipExtensions   = flag.String("skipExt", ".iso,.vmdk,.vdi,.dll,.exe,.bak,.tmp", "Comma-separated list of extensions to skip")
 	skipMimeTypes    = flag.String("skipMimeTypes", "application/x-executable,application/x-sharedlib", "Comma-separated list of MIME types to skip")
 	excludeDirFile   = flag.String("exclude-dir", "", "Path to file containing directories to exclude")
 	internal_address = flag.String("internal_address", "", "Internal Service Gateway Address")
 	internal_tls     = flag.Bool("internal_tls", true, "Use TLS for internal Service Gateway")
 	batchSize        = flag.Int("batchSize", 50, "Number of files to process in a batch")
+	updateInterval   = flag.Duration("updateInterval", 500*time.Millisecond, "Progress update interval")
 
 	// Internal variables
 	excludedDirs     map[string]struct{}
@@ -236,6 +238,10 @@ func scanDirectory(client *amaasclient.AmaasClient, directory string, pool *Scan
 	go func() {
 		err := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
+				if strings.Contains(err.Error(), "no such file or directory") &&
+					strings.Contains(path, "/proc/") {
+					return nil // Skip proc errors silently
+				}
 				logError("Error accessing path %s: %v", path, err)
 				return nil
 			}
@@ -253,6 +259,7 @@ func scanDirectory(client *amaasclient.AmaasClient, directory string, pool *Scan
 
 			if shouldScanFile(path, info) {
 				filesChan <- path
+				progress.bytesProcessed.Add(info.Size())
 			}
 
 			return nil
@@ -289,6 +296,10 @@ func scanDirectory(client *amaasclient.AmaasClient, directory string, pool *Scan
 
 func processBatch(batch []string, pool *ScanWorkerPool, progress *Progress) {
 	for _, filePath := range batch {
+		if info, err := os.Stat(filePath); err == nil {
+			progress.bytesProcessed.Add(info.Size())
+		}
+		
 		pool.wg.Add(1)
 		pool.jobs <- filePath
 		progress.filesProcessed.Add(1)
@@ -350,6 +361,11 @@ func scanFileOnce(client *amaasclient.AmaasClient, filePath string) error {
 }
 
 func shouldSkipDirectory(path string) bool {
+	// Always skip /proc and /sys directories
+	if strings.HasPrefix(path, "/proc/") || strings.HasPrefix(path, "/sys/") {
+		return true
+	}
+
 	normalizedPath := filepath.Clean(path)
 	for excludedDir := range excludedDirs {
 		if strings.HasPrefix(normalizedPath, filepath.Clean(excludedDir)) {
@@ -406,6 +422,36 @@ func logVerbose(format string, v ...interface{}) {
 	if *verbose && verboseLog != nil {
 		verboseLog.Printf(format, v...)
 	}
+}
+
+func (p *Progress) PrintStatus() {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// Throttle updates
+	if time.Since(p.lastUpdate) < *updateInterval {
+		return
+	}
+	p.lastUpdate = time.Now()
+
+	elapsed := time.Since(p.startTime)
+	bytesProcessed := float64(p.bytesProcessed.Load())
+	bytesPerSec := bytesProcessed / elapsed.Seconds()
+	
+	// Format the current directory to be more readable
+	currentDir := p.currentDir
+	if len(currentDir) > 40 {
+		// Show only the last 40 characters with an ellipsis
+		currentDir = "..." + currentDir[len(currentDir)-40:]
+	}
+
+	// Clear the line and print the new status
+	fmt.Printf("\r%-80s\r", "") // Clear the line first
+	fmt.Printf("\rProcessed: %d files, %.2f GB (%.2f MB/s) | Dir: %s",
+		p.filesProcessed.Load(),
+		bytesProcessed/1e9,  // Convert to GB
+		bytesPerSec/1e6,     // Convert to MB/s
+		currentDir)
 }
 
 func periodicCheckpoint(progress *Progress) {
@@ -508,25 +554,11 @@ func loadExcludedDirs() error {
 }
 
 func reportProgress(progress *Progress) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(*updateInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		progress.PrintStatus()
 	}
-}
-
-func (p *Progress) PrintStatus() {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	elapsed := time.Since(p.startTime)
-	bytesPerSec := float64(p.bytesProcessed.Load()) / elapsed.Seconds()
-
-	fmt.Printf("\rProcessed: %d files, %.2f GB, %.2f MB/s, Current: %s",
-		p.filesProcessed.Load(),
-		float64(p.bytesProcessed.Load())/1e9,
-		bytesPerSec/1e6,
-		p.currentDir)
 }
 
 func printSummary(startTime time.Time) {
@@ -540,6 +572,8 @@ func printSummary(startTime time.Time) {
 	fmt.Fprintf(scanLog, "Total Scan Time: %s\n", timeTaken)
 	mu.Unlock()
 
+	// Clear the progress line first
+	fmt.Printf("\r%-80s\r", "")
 	fmt.Println("\n--- Final Scan Summary ---")
 	fmt.Printf("Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
 	fmt.Printf("Files with Malware: %d\n", atomic.LoadInt64(&filesWithMalware))
@@ -576,7 +610,10 @@ func main() {
 	defer client.Destroy()
 
 	// Initialize scanning components
-	progress := &Progress{startTime: time.Now()}
+	progress := &Progress{
+		startTime: time.Now(),
+		lastUpdate: time.Now(),
+	}
 	memMonitor := NewMemoryMonitor(*maxMemoryMB)
 	ioThrottler := NewIOThrottler(*ioThrottle)
 	pool := NewScanWorkerPool(*maxScanWorkers)
