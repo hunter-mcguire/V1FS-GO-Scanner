@@ -203,34 +203,69 @@ var (
 )
 
 func scanFile(client *amaasclient.AmaasClient, filePath string, throttler *IOThrottler, memMonitor *MemoryMonitor) error {
-	// Wait if memory usage is too high
-	for memMonitor.ShouldPause() {
-		time.Sleep(time.Second)
-	}
+    if *verbose {
+        log.Printf("Starting scan of file: %s\n", filePath)
+    }
 
-	// Apply I/O throttling
-	throttler.Acquire()
+    // Wait if memory usage is too high
+    for memMonitor.ShouldPause() {
+        if *verbose {
+            log.Printf("Waiting for memory usage to decrease before scanning %s\n", filePath)
+        }
+        time.Sleep(time.Second)
+    }
 
-	// Scan with retry
-	const maxRetries = 3
-	var lastErr error
+    // Apply I/O throttling
+    throttler.Acquire()
 
-	for retry := 0; retry < maxRetries; retry++ {
-		if retry > 0 {
-			time.Sleep(time.Duration(retry) * time.Second)
-		}
+    // Check if file still exists and is accessible
+    fileInfo, err := os.Stat(filePath)
+    if err != nil {
+        if *verbose {
+            log.Printf("Error accessing file %s: %v\n", filePath, err)
+        }
+        return err
+    }
 
-		if err := scanFileOnce(client, filePath); err != nil {
-			lastErr = err
-			if err != context.DeadlineExceeded {
-				return err
-			}
-			continue
-		}
-		return nil
-	}
+    // Double check file is not a directory or special file
+    if fileInfo.IsDir() || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.Mode()&os.ModeNamedPipe != 0 {
+        if *verbose {
+            log.Printf("Skipping non-regular file: %s\n", filePath)
+        }
+        return nil
+    }
 
-	return fmt.Errorf("max retries exceeded: %v", lastErr)
+    // Scan with retry
+    const maxRetries = 3
+    var lastErr error
+
+    for retry := 0; retry < maxRetries; retry++ {
+        if retry > 0 {
+            if *verbose {
+                log.Printf("Retry %d for file: %s\n", retry, filePath)
+            }
+            time.Sleep(time.Duration(retry) * time.Second)
+        }
+
+        if err := scanFileOnce(client, filePath); err != nil {
+            lastErr = err
+            if *verbose {
+                log.Printf("Scan attempt %d failed for %s: %v\n", retry+1, filePath, err)
+            }
+            if err != context.DeadlineExceeded {
+                return err
+            }
+            continue
+        }
+        
+        if *verbose {
+            log.Printf("Successfully scanned file: %s\n", filePath)
+        }
+        atomic.AddInt64(&totalScanned, 1)
+        return nil
+    }
+
+    return fmt.Errorf("max retries exceeded for %s: %v", filePath, lastErr)
 }
 
 func scanFileOnce(client *amaasclient.AmaasClient, filePath string) error {
@@ -442,44 +477,71 @@ func reportProgress(progress *Progress) {
 }
 
 func scanDirectory(client *amaasclient.AmaasClient, directory string, pool *ScanWorkerPool, progress *Progress, throttler *IOThrottler, memMonitor *MemoryMonitor) error {
-	// Load checkpoint if exists
-	checkpoint, _ := loadCheckpoint()
-	if checkpoint != nil {
-		atomic.StoreInt64(&totalScanned, checkpoint.TotalScanned)
-	}
+    // Load checkpoint if exists
+    checkpoint, _ := loadCheckpoint()
+    if checkpoint != nil {
+        atomic.StoreInt64(&totalScanned, checkpoint.TotalScanned)
+    }
 
-	// Start periodic checkpoint saving
-	go periodicCheckpoint(progress)
+    // Start periodic checkpoint saving
+    go periodicCheckpoint(progress)
 
-	// Walk directory
-	return filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+    if *verbose {
+        log.Printf("Starting scan of directory: %s\n", directory)
+    }
 
-		// Update progress
-		progress.mu.Lock()
-		progress.currentDir = filepath.Dir(path)
-		progress.mu.Unlock()
+    // Walk directory
+    return filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
+        if err != nil {
+            if *verbose {
+                log.Printf("Error accessing path %s: %v\n", path, err)
+            }
+            return nil // Continue walking even if there's an error with one path
+        }
 
-		// Check if directory should be skipped
-		if info.IsDir() {
-			if shouldSkipDirectory(path) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
+        // Update progress
+        progress.mu.Lock()
+        progress.currentDir = filepath.Dir(path)
+        progress.mu.Unlock()
 
-		// Check if file should be scanned
-		if shouldScanFile(path, info) {
-			pool.wg.Add(1)
-			pool.jobs <- path
-			progress.bytesProcessed.Add(info.Size())
-			progress.filesProcessed.Add(1)
-		}
+        // Skip if directory
+        if info.IsDir() {
+            if *verbose {
+                log.Printf("Checking directory: %s\n", path)
+            }
+            if shouldSkipDirectory(path) {
+                if *verbose {
+                    log.Printf("Skipping excluded directory: %s\n", path)
+                }
+                return filepath.SkipDir
+            }
+            return nil
+        }
 
-		return nil
-	})
+        // Check if file should be scanned
+        if shouldScanFile(path, info) {
+            if *verbose {
+                log.Printf("Queueing file for scan: %s\n", path)
+            }
+            pool.wg.Add(1)
+            select {
+            case pool.jobs <- path:
+                atomic.AddInt64(&totalScanned, 1)
+                progress.bytesProcessed.Add(info.Size())
+                progress.filesProcessed.Add(1)
+            default:
+                // If channel is full, process synchronously
+                if err := scanFile(client, path, throttler, memMonitor); err != nil {
+                    log.Printf("Error scanning file %s: %v\n", path, err)
+                }
+                pool.wg.Done()
+            }
+        } else if *verbose {
+            log.Printf("Skipping file due to filters: %s\n", path)
+        }
+
+        return nil
+    })
 }
 
 func shouldSkipDirectory(path string) bool {
