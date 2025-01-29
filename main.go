@@ -528,7 +528,7 @@ func initializeClient(apiKey string) {
 
 	// Check if digest should be disabled
 	if *disableDigest {
-		client.DisableDigest()
+		client.SetDigestOff()
 		logVerbose("Digest calculation disabled for improved performance")
 	}
 
