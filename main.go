@@ -6,9 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -204,6 +202,129 @@ var (
 	scanLog         *os.File
 )
 
+func scanFile(client *amaasclient.AmaasClient, filePath string, throttler *IOThrottler, memMonitor *MemoryMonitor) error {
+	// Wait if memory usage is too high
+	for memMonitor.ShouldPause() {
+		time.Sleep(time.Second)
+	}
+
+	// Apply I/O throttling
+	throttler.Acquire()
+
+	// Scan with retry
+	const maxRetries = 3
+	var lastErr error
+
+	for retry := 0; retry < maxRetries; retry++ {
+		if retry > 0 {
+			time.Sleep(time.Duration(retry) * time.Second)
+		}
+
+		if err := scanFileOnce(client, filePath); err != nil {
+			lastErr = err
+			if err != context.DeadlineExceeded {
+				return err
+			}
+			continue
+		}
+		return nil
+	}
+
+	return fmt.Errorf("max retries exceeded: %v", lastErr)
+}
+
+func scanFileOnce(client *amaasclient.AmaasClient, filePath string) error {
+	rawResult, err := client.ScanFile(filePath, tags)
+	if err != nil {
+		return err
+	}
+
+	var result ScanResult
+	if err := json.Unmarshal([]byte(rawResult), &result); err != nil {
+		return err
+	}
+
+	// Update counters
+	if len(result.FoundMalwares) > 0 {
+		atomic.AddInt64(&filesWithMalware, 1)
+	} else {
+		atomic.AddInt64(&filesClean, 1)
+	}
+
+	// Log the scan result
+	mu.Lock()
+	fmt.Fprintf(scanLog, "%s\n", rawResult)
+	mu.Unlock()
+
+	return nil
+}
+
+func testAuth(client *amaasclient.AmaasClient) error {
+	_, err := client.ScanBuffer([]byte(""), "testAuth", nil)
+	return err
+}
+
+func loadExcludedDirs() error {
+	if *excludeDirFile == "" {
+		return nil
+	}
+
+	file, err := os.Open(*excludeDirFile)
+	if err != nil {
+		return fmt.Errorf("Error opening exclusion file: %v", err)
+	}
+	defer file.Close()
+
+	excludedDirs = make(map[string]struct{})
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		dir := strings.TrimSpace(scanner.Text())
+		if dir != "" {
+			excludedDirs[dir] = struct{}{}
+		}
+	}
+
+	return scanner.Err()
+}
+
+func loadCheckpoint() (*ScanCheckpoint, error) {
+	data, err := os.ReadFile("scan_checkpoint.json")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var checkpoint ScanCheckpoint
+	err = json.Unmarshal(data, &checkpoint)
+	return &checkpoint, err
+}
+
+func saveCheckpoint(checkpoint ScanCheckpoint) error {
+	data, err := json.Marshal(checkpoint)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile("scan_checkpoint.json", data, 0644)
+}
+
+func periodicCheckpoint(progress *Progress) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		checkpoint := ScanCheckpoint{
+			LastScannedPath: progress.currentDir,
+			TotalScanned:    atomic.LoadInt64(&totalScanned),
+			Timestamp:       time.Now(),
+		}
+		if err := saveCheckpoint(checkpoint); err != nil {
+			log.Printf("Error saving checkpoint: %v", err)
+		}
+	}
+}
+
 func main() {
 	// Parse command-line flags
 	flag.Var(&tags, "tags", "Up to 8 strings separated by commas")
@@ -353,6 +474,8 @@ func scanDirectory(client *amaasclient.AmaasClient, directory string, pool *Scan
 		if shouldScanFile(path, info) {
 			pool.wg.Add(1)
 			pool.jobs <- path
+			progress.bytesProcessed.Add(info.Size())
+			progress.filesProcessed.Add(1)
 		}
 
 		return nil
@@ -389,139 +512,9 @@ func shouldScanFile(path string, info os.FileInfo) bool {
 	return true
 }
 
-func scanFile(client *amaasclient.AmaasClient, filePath string, throttler *IOThrottler, memMonitor *MemoryMonitor) error {
-	start := time.Now()
-
-	// Wait if memory usage is too high
-	for memMonitor.ShouldPause() {
-		time.Sleep(time.Second)
-	}
-
-	// Apply I/O throttling
-	throttler.Acquire()
-
-	// Scan with retry
-	const maxRetries = 3
-	var lastErr error
-
-	for retry := 0; retry < maxRetries; retry++ {
-		if retry > 0 {
-			time.Sleep(time.Duration(retry) * time.Second)
-		}
-
-		err := scanFileOnce(client, filePath)
-		if err == nil {
-			return nil
-		}
-
-		if err == context.DeadlineExceeded {
-			lastErr = err
-			continue
-		}
-
-		return err
-	}
-
-	return fmt.Errorf("max retries exceeded: %v", lastErr)
-}
-
-func scanFileOnce(client *amaasclient.AmaasClient, filePath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	rawResult, err := client.ScanFile(filePath, tags)
-	if err != nil {
-		return err
-	}
-
-	var result ScanResult
-	if err := json.Unmarshal([]byte(rawResult), &result); err != nil {
-		return err
-	}
-
-	// Update counters
-	if len(result.FoundMalwares) > 0 {
-		atomic.AddInt64(&filesWithMalware, 1)
-	} else {
-		atomic.AddInt64(&filesClean, 1)
-	}
-
-	// Log the scan result
-	mu.Lock()
-	fmt.Fprintf(scanLog, "%s\n", rawResult)
-	mu.Unlock()
-
-	return nil
-}
-
-func testAuth(client *amaasclient.AmaasClient) error {
-	_, err := client.ScanBuffer([]byte(""), "testAuth", nil)
-	return err
-}
-
-func loadExcludedDirs() error {
-	if *excludeDirFile == "" {
-		return nil
-	}
-
-	file, err := os.Open(*excludeDirFile)
-	if err != nil {
-		return fmt.Errorf("Error opening exclusion file: %v", err)
-	}
-	defer file.Close()
-
-	excludedDirs = make(map[string]struct{})
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		dir := strings.TrimSpace(scanner.Text())
-		if dir != "" {
-			excludedDirs[dir] = struct{}{}
-		}
-	}
-
-	return scanner.Err()
-}
-
-func loadCheckpoint() (*ScanCheckpoint, error) {
-	data, err := os.ReadFile("scan_checkpoint.json")
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var checkpoint ScanCheckpoint
-	err = json.Unmarshal(data, &checkpoint)
-	return &checkpoint, err
-}
-
-func saveCheckpoint(checkpoint ScanCheckpoint) error {
-	data, err := json.Marshal(checkpoint)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile("scan_checkpoint.json", data, 0644)
-}
-
-func periodicCheckpoint(progress *Progress) {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		checkpoint := ScanCheckpoint{
-			LastScannedPath: progress.currentDir,
-			TotalScanned:    atomic.LoadInt64(&totalScanned),
-			Timestamp:       time.Now(),
-		}
-		if err := saveCheckpoint(checkpoint); err != nil {
-			log.Printf("Error saving checkpoint: %v", err)
-		}
-	}
-}
-
 func printSummary(startTime time.Time) {
 	timeTaken := time.Since(startTime)
+	
 	mu.Lock()
 	fmt.Fprintf(scanLog, "\n--- Final Scan Summary ---\n")
 	fmt.Fprintf(scanLog, "Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
