@@ -429,6 +429,11 @@ func periodicCheckpoint(progress *Progress) {
 		}
 
 		tempFile := "scan_checkpoint.json.tmp"
+		if err := os.WriteFile(tempFile, buf.Bytes(), 0644); err != nil {
+			logError("Error writing checkpoint: %v", err)
+			continue
+		}
+
 		if err := os.Rename(tempFile, "scan_checkpoint.json"); err != nil {
 			logError("Error saving checkpoint: %v", err)
 			os.Remove(tempFile)
@@ -597,9 +602,4 @@ func main() {
 
 	// Print final summary
 	printSummary(startTime)
-}WriteFile(tempFile, buf.Bytes(), 0644); err != nil {
-			logError("Error writing checkpoint: %v", err)
-			continue
-		}
-
-		if err := os.
+}
