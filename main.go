@@ -435,4 +435,104 @@ func scanFileOnce(client *amaasclient.AmaasClient, filePath string) error {
 	}
 
 	var result ScanResult
-	if err := json.Unm
+	if err := json.Unmarshal([]byte(rawResult), &result); err != nil {
+		return err
+	}
+
+	// Update counters
+	if len(result.FoundMalwares) > 0 {
+		atomic.AddInt64(&filesWithMalware, 1)
+	} else {
+		atomic.AddInt64(&filesClean, 1)
+	}
+
+	// Log the scan result
+	mu.Lock()
+	fmt.Fprintf(scanLog, "%s\n", rawResult)
+	mu.Unlock()
+
+	return nil
+}
+
+func testAuth(client *amaasclient.AmaasClient) error {
+	_, err := client.ScanBuffer([]byte(""), "testAuth", nil)
+	return err
+}
+
+func loadExcludedDirs() error {
+	if *excludeDirFile == "" {
+		return nil
+	}
+
+	file, err := os.Open(*excludeDirFile)
+	if err != nil {
+		return fmt.Errorf("Error opening exclusion file: %v", err)
+	}
+	defer file.Close()
+
+	excludedDirs = make(map[string]struct{})
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		dir := strings.TrimSpace(scanner.Text())
+		if dir != "" {
+			excludedDirs[dir] = struct{}{}
+		}
+	}
+
+	return scanner.Err()
+}
+
+func loadCheckpoint() (*ScanCheckpoint, error) {
+	data, err := os.ReadFile("scan_checkpoint.json")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var checkpoint ScanCheckpoint
+	err = json.Unmarshal(data, &checkpoint)
+	return &checkpoint, err
+}
+
+func saveCheckpoint(checkpoint ScanCheckpoint) error {
+	data, err := json.Marshal(checkpoint)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile("scan_checkpoint.json", data, 0644)
+}
+
+func periodicCheckpoint(progress *Progress) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		checkpoint := ScanCheckpoint{
+			LastScannedPath: progress.currentDir,
+			TotalScanned:    atomic.LoadInt64(&totalScanned),
+			Timestamp:       time.Now(),
+		}
+		if err := saveCheckpoint(checkpoint); err != nil {
+			log.Printf("Error saving checkpoint: %v", err)
+		}
+	}
+}
+
+func printSummary(startTime time.Time) {
+	timeTaken := time.Since(startTime)
+	mu.Lock()
+	fmt.Fprintf(scanLog, "\n--- Final Scan Summary ---\n")
+	fmt.Fprintf(scanLog, "Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
+	fmt.Fprintf(scanLog, "Files with Malware: %d\n", atomic.LoadInt64(&filesWithMalware))
+	fmt.Fprintf(scanLog, "Files Clean: %d\n", atomic.LoadInt64(&filesClean))
+	fmt.Fprintf(scanLog, "Total Scan Time: %s\n", timeTaken)
+	mu.Unlock()
+
+	fmt.Println("\n--- Final Scan Summary ---")
+	fmt.Printf("Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
+	fmt.Printf("Files with Malware: %d\n", atomic.LoadInt64(&filesWithMalware))
+	fmt.Printf("Files Clean: %d\n", atomic.LoadInt64(&filesClean))
+	fmt.Printf("Total Scan Time: %s\n", timeTaken)
+}
