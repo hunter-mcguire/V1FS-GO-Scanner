@@ -451,21 +451,41 @@ func initializeClient(apiKey string) {
 	}
 }
 
-func initializeLogging() {
-	timestamp := time.Now().Format("01-02-2006T15:04")
-	logFile := fmt.Sprintf("%s.error.log", timestamp)
-	errorLog, err := os.OpenFile(logFile, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.SetOutput(errorLog)
-	log.SetFlags(log.Lshortfile | log.LstdFlags)
+// Separate loggers for errors and verbose output
+var (
+    errorLog *log.Logger
+    verboseLog *log.Logger
+)
 
-	scanLogFile := fmt.Sprintf("%s-Scan.log", timestamp)
-	scanLog, err = os.OpenFile(scanLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatalf("Error creating scan log file: %v", err)
-	}
+func initializeLogging() {
+    // Initialize error logging
+    timestamp := time.Now().Format("01-02-2006T15:04")
+    errorLogFile := fmt.Sprintf("%s.error.log", timestamp)
+    errorFile, err := os.OpenFile(errorLogFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+    if err != nil {
+        log.Fatal(err)
+    }
+    errorLog = log.New(errorFile, "", log.Lshortfile|log.LstdFlags)
+
+    // Initialize verbose logging to stdout if verbose mode is enabled
+    if *verbose {
+        verboseLog = log.New(os.Stdout, "", log.Lshortfile|log.LstdFlags)
+    }
+
+    // Initialize scan log file
+    scanLogFile := fmt.Sprintf("%s-Scan.log", timestamp)
+    scanLog, err = os.OpenFile(scanLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    if err != nil {
+        errorLog.Fatalf("Error creating scan log file: %v", err)
+    }
+}
+
+// Helper function for verbose logging
+func logVerbose(format string, v ...interface{}) {
+    if *verbose && verboseLog != nil {
+        verboseLog.Printf(format, v...)
+    }
+}
 }
 
 func reportProgress(progress *Progress) {
