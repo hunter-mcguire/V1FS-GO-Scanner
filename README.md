@@ -22,12 +22,6 @@ Link to Github SDK Repo: https://github.com/trendmicro/tm-v1-fs-golang-sdk
 | -verbose | bool | false | Log all scans to stdout |
 | -exclude-dir | string | "" | Path to file containing directories to exclude |
 
-### Scanning Features
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| -pml | bool | false | Enable predictive machine learning detection |
-| -feedback | bool | false | Enable Smart Protection Network feedback |
-
 ### Performance Optimization
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -36,42 +30,11 @@ Link to Github SDK Repo: https://github.com/trendmicro/tm-v1-fs-golang-sdk
 | -maxMemoryMB | int64 | 1024 | Maximum memory usage in MB |
 | -iothrottle | int | 0 | Milliseconds to wait between file operations |
 
-### File Filtering
+### Feature Flags
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| -skipExt | string | ".iso,.vmdk,.vdi,.dll" | Comma-separated list of extensions to skip |
-| -skipMimeTypes | string | "application/x-executable,application/x-sharedlib" | Comma-separated list of MIME types to skip |
-
-### Advanced Options
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| -internal_address | string | "" | Internal Service Gateway Address |
-| -internal_tls | bool | true | Use TLS for internal Service Gateway |
-
-*Note: Parameters marked with an asterisk (*) are required*
-
-## Example Usage
-
-### Basic Usage
-```sh
-./v1_fs_go_scanner -apiKey=<v1_api_key> -directory=/tmp/some_folder -maxWorkers=200 -tags=dev,us-east-1,temp_project -verbose=true
-```
-
-### Optimized for Large Volumes
-```sh
-./v1_fs_go_scanner \
-  -apiKey=<v1_api_key> \
-  -directory=/data \
-  -maxWorkers=150 \
-  -maxMemoryMB=4096 \
-  -maxFileSize=250000000 \
-  -minFileSize=4096 \
-  -skipExt=".iso,.vmdk,.vdi,.dll,.exe,.bak,.tmp" \
-  -iothrottle=10 \
-  -verbose=true \
-  -tags=dev,us-east-1,temp_project \
-  -exclude-dir exclusion_dir_list.txt
-```
+| -pml | bool | false | Enable predictive machine learning detection |
+| -feedback | bool | false | Enable Smart Protection Network feedback |
 
 ## Output Files
 
@@ -81,29 +44,46 @@ The program creates the following log files in its running directory:
 |----------|-------------|
 | "{timestamp}-Scan.log" | Documents total files scanned, scan results, and execution time |
 | "{timestamp}-error.log" | Logs any file scan errors |
-| "{timestamp}-skipped_files.log" | Logs files that were skipped due to errors or filters |
-| "scan_checkpoint.json" | Periodic checkpoint file for scan progress (enables resume capability) |
 
-## Performance Features
+## Performance Tips
 
-- **Progress Monitoring**: Shows real-time scanning progress every 5 seconds
-- **Memory Management**: Automatically pauses scanning when memory usage is high
-- **I/O Control**: Throttling option to prevent system overload
-- **Checkpointing**: Enables resuming interrupted scans
-- **Smart Filtering**: Skip files based on size, type, and extension
-- **Concurrent Processing**: Optimized worker pool for parallel scanning
+### Exclusion File
+Create a text file with directories to exclude (one per line). For optimal performance, consider excluding system directories that don't need scanning:
 
-## Best Practices
+Recommended exclusions for Linux systems:
+```
+/sys
+/proc
+/dev
+/run
+/etc/ssl
+/var/lib/docker
+/var/run
+/boot
+```
 
-1. For large volumes (>1TB):
-   - Use appropriate `-maxWorkers` based on CPU cores
-   - Set `-maxMemoryMB` to prevent memory exhaustion
-   - Enable `-iothrottle` to prevent I/O overload
-   - Use `-skipExt` and `-skipMimeTypes` to filter unnecessary files
+Example usage with exclusions:
+```sh
+# Create exclusions.txt with your preferred directories to exclude
+./v1_fs_scanner_linux \
+  -apiKey=$TMAS_API_KEY \
+  -directory=/path/to/scan \
+  -exclude-dir=exclusions.txt \
+  -maxWorkers=250 \
+  -maxMemoryMB=4096
+```
+
+### Best Practices for Large Volumes
+
+1. For volumes > 1TB:
+   - Use appropriate `-maxWorkers` based on CPU cores (try 200-300)
+   - Set `-maxMemoryMB` to prevent memory exhaustion (4096 or higher)
+   - Use `-iothrottle=1` to prevent I/O overload
+   - Create an exclusions file to skip unnecessary directories
 
 2. For network-mounted volumes:
    - Reduce `-maxWorkers` to prevent network saturation
-   - Increase `-iothrottle` value
+   - Increase `-iothrottle` value (try 5-10ms)
    - Consider using smaller `-maxFileSize` limit
 
 3. For local SSDs:
@@ -111,11 +91,25 @@ The program creates the following log files in its running directory:
    - Minimal or no `-iothrottle` needed
    - Can handle larger `-maxFileSize` values
 
-## Error Handling
+## Example Configurations
 
-The scanner implements several error handling mechanisms:
-- Automatic retry for failed scans
-- Timeout handling for stuck operations
-- Graceful shutdown on interruption
-- Detailed error logging
-- Skip logging for filtered files
+### Basic Usage
+```sh
+./v1_fs_scanner_linux -apiKey=<v1_api_key> -directory=/tmp/some_folder
+```
+
+### Optimized for Large Volumes
+```sh
+./v1_fs_scanner_linux \
+  -apiKey=$TMAS_API_KEY \
+  -directory=/data \
+  -maxWorkers=250 \
+  -maxMemoryMB=4096 \
+  -maxFileSize=50000000 \
+  -minFileSize=1000 \
+  -skipExt=".iso,.vmdk,.vdi,.dll,.exe,.bak,.tmp" \
+  -iothrottle=1 \
+  -verbose=true \
+  -tags=dev,us-east-1,temp_project \
+  -exclude-dir=exclusions.txt
+```
