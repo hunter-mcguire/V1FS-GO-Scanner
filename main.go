@@ -73,6 +73,7 @@ var (
 	client          *amaasclient.AmaasClient // FS Client
 	mu              sync.Mutex               // Mutex for thread-safe access to log file
 	scanLog         *os.File                 // File to log scanned files and results
+	skippedFilesLog *os.File // File to log skipped files
 )
 
 func testAuth(client *amaasclient.AmaasClient) error {
@@ -113,122 +114,126 @@ func loadExcludedDirs() error {
 }
 
 func main() {
-	// Parse command-line flags
-	flag.Var(&tags, "tags", "Up to 8 strings separated by commas")
-	flag.Parse()
+    // Parse command-line flags
+    flag.Var(&tags, "tags", "Up to 8 strings separated by commas")
+    flag.Parse()
 
-	var v1ApiKey string
-	var err error
+    // Create timestamp-based log file name
+    timestamp := time.Now().Format("01-02-2006T15:04")
+    skipLogFile := fmt.Sprintf("%s-skipped_files.log", timestamp)
 
-	// Get timeout limit from the flag
-	timeout := time.Duration(*timeoutLimit) * time.Second
+    var err error // Declare the error variable once
+    skippedFilesLog, err = os.OpenFile(skipLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    if err != nil {
+        log.Fatalf("Error creating skipped files log: %v", err)
+    }
+    defer skippedFilesLog.Close()
 
+    // Get timeout limit from the flag
+    timeout := time.Duration(*timeoutLimit) * time.Second
 
-	// Check for required arguments
-	k, e := os.LookupEnv("V1_FS_KEY")
-	if e {
-		v1ApiKey = k
-	} else {
-		if *apiKey == "" {
-			flag.PrintDefaults()
-			log.Fatal("Use V1_FS_KEY env var or -apiKey parameter")
-		} else {
-			v1ApiKey = *apiKey
-		}
-	}
+    // Check for required arguments
+    var v1ApiKey string
+    k, e := os.LookupEnv("V1_FS_KEY")
+    if e {
+        v1ApiKey = k
+    } else {
+        if *apiKey == "" {
+            flag.PrintDefaults()
+            log.Fatal("Use V1_FS_KEY env var or -apiKey parameter")
+        } else {
+            v1ApiKey = *apiKey
+        }
+    }
 
-	if *directory == "" {
-		flag.PrintDefaults()
-		log.Fatal("Missing required argument: -directory")
-	}
+    if *directory == "" {
+        flag.PrintDefaults()
+        log.Fatal("Missing required argument: -directory")
+    }
 
-	// Load exclusion directories if provided
-	if err := loadExcludedDirs(); err != nil {
-		log.Fatalf("Error loading exclusion directories: %v", err)
-	}
+    // Load exclusion directories if provided
+    if err := loadExcludedDirs(); err != nil {
+        log.Fatalf("Error loading exclusion directories: %v", err)
+    }
 
-	// Create Vision One client
-	if *internal_address != "" {
-		client, err = amaasclient.NewClientInternal(v1ApiKey, *internal_address, *internal_tls)
-		if err != nil {
-			log.Fatalf("Error creating client: %v", err)
-		}
-	} else {
-		client, err = amaasclient.NewClient(v1ApiKey, *region)
-		if err != nil {
-			log.Fatalf("Error creating client: %v", err)
-		}
-	}
+    // Create Vision One client
+    if *internal_address != "" {
+        client, err = amaasclient.NewClientInternal(v1ApiKey, *internal_address, *internal_tls)
+        if err != nil {
+            log.Fatalf("Error creating client: %v", err)
+        }
+    } else {
+        client, err = amaasclient.NewClient(v1ApiKey, *region)
+        if err != nil {
+            log.Fatalf("Error creating client: %v", err)
+        }
+    }
 
-	if *pml {
-		client.SetPMLEnable()
-	}
+    if *pml {
+        client.SetPMLEnable()
+    }
 
-	if *feedback {
-		client.SetFeedbackEnable()
-	}
+    if *feedback {
+        client.SetFeedbackEnable()
+    }
 
-	authTest := testAuth(client)
+    authTest := testAuth(client)
 
-	if authTest != nil {
-		fmt.Println("Bad Credentials. Check API KEY and role permissions")
-		os.Exit(1)
-	}
+    if authTest != nil {
+        fmt.Println("Bad Credentials. Check API KEY and role permissions")
+        os.Exit(1)
+    }
 
-	defer client.Destroy()
+    defer client.Destroy()
 
-	// Initialize logging
-	timestamp := time.Now().Format("01-02-2006T15:04")
-	LOG_FILE := fmt.Sprintf("%s.error.log", timestamp)
-	logFile, err := os.OpenFile(LOG_FILE, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		log.Panic(err)
-	}
-	defer logFile.Close()
-	log.SetOutput(logFile)
-	log.SetFlags(log.Lshortfile | log.LstdFlags)
+    // Initialize logging
+    logFile, err := os.OpenFile(fmt.Sprintf("%s.error.log", timestamp), os.O_RDWR|os.O_CREATE, 0644)
+    if err != nil {
+        log.Panic(err)
+    }
+    defer logFile.Close()
+    log.SetOutput(logFile)
+    log.SetFlags(log.Lshortfile | log.LstdFlags)
 
-	// Initialize the scan log file
-	scanLogFile := fmt.Sprintf("%s-Scan.log", timestamp)
-	scanLog, err = os.OpenFile(scanLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Fatalf("Error creating scan log file: %v", err)
-	}
-	defer scanLog.Close()
+    // Initialize the scan log file
+    scanLogFile := fmt.Sprintf("%s-Scan.log", timestamp)
+    scanLog, err = os.OpenFile(scanLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    if err != nil {
+        log.Fatalf("Error creating scan log file: %v", err)
+    }
+    defer scanLog.Close()
 
-	// Initialize channel for file scan concurrency control with an appropriate limit
-	var scanFileChannel chan struct{}
+    // Initialize channel for file scan concurrency control with an appropriate limit
+    var scanFileChannel chan struct{}
 
-	func() {
-		if *maxScanWorkers == -1 {
-			scanFileChannel = make(chan struct{})
-		} else {
-			scanFileChannel = make(chan struct{}, *maxScanWorkers)
-		}
-	}()
+    if *maxScanWorkers == -1 {
+        scanFileChannel = make(chan struct{})
+    } else {
+        scanFileChannel = make(chan struct{}, *maxScanWorkers)
+    }
 
-	// Start scanning the initial directory
-	startTime := time.Now()
-	waitGroup.Add(1)
-	go scanDirectory(client, *directory, scanFileChannel, timeout)
+    // Start scanning the initial directory
+    startTime := time.Now()
+    waitGroup.Add(1)
+    go scanDirectory(client, *directory, scanFileChannel, timeout)
 
-	// Wait for all goroutines to finish before exiting
-	waitGroup.Wait()
+    // Wait for all goroutines to finish before exiting
+    waitGroup.Wait()
 
-	// Calculate total scan time
-	timeTaken := time.Since(startTime)
+    // Calculate total scan time
+    timeTaken := time.Since(startTime)
 
-	// Write scan statistics and GRC summary to log file
-	mu.Lock()
-	fmt.Fprintf(scanLog, "Total Scan Time: %s\nTotal Files Scanned: %d\nFiles with Malware: %d\nFiles Clean: %d\n", timeTaken, atomic.LoadInt64(&totalScanned), atomic.LoadInt64(&filesWithMalware), atomic.LoadInt64(&filesClean))
-	mu.Unlock()
+    // Write scan statistics and GRC summary to log file
+    mu.Lock()
+    fmt.Fprintf(scanLog, "Total Scan Time: %s\nTotal Files Scanned: %d\nFiles with Malware: %d\nFiles Clean: %d\n", timeTaken, atomic.LoadInt64(&totalScanned), atomic.LoadInt64(&filesWithMalware), atomic.LoadInt64(&filesClean))
+    mu.Unlock()
 
-	// Output the summary to the terminal
-	fmt.Println("\n--- Scan Summary ---")
-	fmt.Printf("Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
-	fmt.Printf("Files with Malware: %d\n", atomic.LoadInt64(&filesWithMalware))
-	fmt.Printf("Files Clean: %d\n", atomic.LoadInt64(&filesClean))
-	fmt.Printf("Total Scan Time: %s\n", time.Since(startTime))
+    // Output the summary to the terminal
+    fmt.Println("\n--- Scan Summary ---")
+    fmt.Printf("Total Files Scanned: %d\n", atomic.LoadInt64(&totalScanned))
+    fmt.Printf("Files with Malware: %d\n", atomic.LoadInt64(&filesWithMalware))
+    fmt.Printf("Files Clean: %d\n", atomic.LoadInt64(&filesClean))
+    fmt.Printf("Total Scan Time: %s\n", timeTaken)
 }
 
 // Function to recursively scan a directory
@@ -381,21 +386,13 @@ func logSkippedFile(filePath string, err error) {
     mu.Lock()
     defer mu.Unlock()
 
-    // Use the same timestamp pattern as other log files
-    timestamp := time.Now().Format("01-02-2006T15:04")
-    skipLogFile := fmt.Sprintf("%s-skipped_files.log", timestamp)
-
-    // Open the skipped files log for appending
-    file, fileErr := os.OpenFile(skipLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    // Write the skipped file details to the pre-initialized log file
+    logEntry := fmt.Sprintf("Skipped: %s, Error: %v\n", filePath, err)
+    _, fileErr := skippedFilesLog.WriteString(logEntry)
     if fileErr != nil {
-        log.Printf("Error creating skipped files log: %v\n", fileErr)
+        log.Printf("Error writing to skipped files log: %v\n", fileErr)
         return
     }
-    defer file.Close()
-
-    // Write the skipped file details to the log
-    logEntry := fmt.Sprintf("Skipped: %s, Error: %v\n", filePath, err)
-    file.WriteString(logEntry)
 
     if *verbose {
         log.Printf("Logged skipped file: %s\n", logEntry)
