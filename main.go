@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"bufio"
 	"encoding/json"
 	"flag"
@@ -290,6 +291,7 @@ func scanDirectory(client *amaasclient.AmaasClient, directory string, scanFileCh
 
 func scanFile(client *amaasclient.AmaasClient, filePath string) error {
     start := time.Now()
+    timeout := 10 * time.Second // Set timeout duration
 
     // Log the file being considered if verbose mode is on
     if *verbose {
@@ -302,6 +304,7 @@ func scanFile(client *amaasclient.AmaasClient, filePath string) error {
         if *verbose {
             log.Printf("Error opening file %s: %v\n", filePath, err)
         }
+        logSkippedFile(filePath, err)
         return err
     }
 
@@ -313,10 +316,11 @@ func scanFile(client *amaasclient.AmaasClient, filePath string) error {
         if *verbose {
             log.Printf("Error getting file info for %s: %v\n", filePath, err)
         }
+        logSkippedFile(filePath, err)
         return err
     }
 
-    // Skip special files (e.g., directories, sockets, device files)
+    // Skip special files
     if fileInfo.Mode().IsDir() || fileInfo.Mode()&os.ModeSymlink != 0 || fileInfo.Mode()&os.ModeNamedPipe != 0 || fileInfo.Mode()&os.ModeSocket != 0 {
         if *verbose {
             log.Printf("Skipping special file %s\n", filePath)
@@ -324,44 +328,81 @@ func scanFile(client *amaasclient.AmaasClient, filePath string) error {
         return nil
     }
 
-    // Continue with the scanning process...
-    defer func() {
-        atomic.AddInt64(&totalScanned, 1) // Thread-safe increment
-        mu.Lock()
-        // Log the scanned file path and scan result to the scan log
-        fmt.Fprintf(scanLog, "Scanned: %s, Duration: %s\n", filePath, time.Since(start))
-        mu.Unlock()
+    // Use a context with a timeout for scanning
+    ctx, cancel := context.WithTimeout(context.Background(), timeout)
+    defer cancel()
+
+    scanErrChan := make(chan error, 1)
+
+    // Start scanning in a separate goroutine
+    go func() {
+        rawResult, err := client.ScanFile(filePath, tags)
+        if err == nil {
+            var result ScanResult
+            err := json.Unmarshal([]byte(rawResult), &result)
+            if err == nil {
+                if len(result.FoundMalwares) > 0 {
+                    atomic.AddInt64(&filesWithMalware, 1)
+                } else {
+                    atomic.AddInt64(&filesClean, 1)
+                }
+
+                // Log the result of the scan in JSON format (for detailed review)
+                mu.Lock()
+                fmt.Fprintf(scanLog, "%s\n", rawResult)
+                mu.Unlock()
+            }
+        }
+        scanErrChan <- err
     }()
 
-    // Call Vision One SDK to scan the file
-    rawResult, err := client.ScanFile(filePath, tags)
-    if err == nil {
-        var result ScanResult
-        err := json.Unmarshal([]byte(rawResult), &result)
-        if err != nil {
+    select {
+    case <-ctx.Done():
+        if *verbose {
+            log.Printf("File scan timed out: %s\n", filePath)
+        }
+        logSkippedFile(filePath, fmt.Errorf("scan timed out"))
+        return ctx.Err()
+    case scanErr := <-scanErrChan:
+        if scanErr != nil {
             if *verbose {
-                log.Printf("Error parsing scan result for file %s: %v\n", filePath, err)
+                log.Printf("Error scanning file %s: %v\n", filePath, scanErr)
             }
-            return err
+            logSkippedFile(filePath, scanErr)
+            return scanErr
         }
-
-        // Analyze the scan result
-        if len(result.FoundMalwares) > 0 {
-            atomic.AddInt64(&filesWithMalware, 1)
-        } else {
-            atomic.AddInt64(&filesClean, 1)
-        }
-
-        // Log the result of the scan in JSON format (for detailed review)
-        mu.Lock()
-        fmt.Fprintf(scanLog, "%s\n", rawResult)
-        mu.Unlock()
     }
 
-    // Print concise output to the terminal
-    if err == nil && *verbose {
+    atomic.AddInt64(&totalScanned, 1) // Thread-safe increment
+    mu.Lock()
+    // Log the scanned file path and scan duration
+    fmt.Fprintf(scanLog, "Scanned: %s, Duration: %s\n", filePath, time.Since(start))
+    mu.Unlock()
+
+    if *verbose {
         fmt.Printf("Scanned: %s [scanned in %s]\n", filePath, time.Since(start))
     }
 
-    return err
+    return nil
+}
+
+// Function to log skipped files due to errors
+func logSkippedFile(filePath string, err error) {
+    mu.Lock()
+    defer mu.Unlock()
+
+    skipLogFile := "skipped_files.log"
+    file, fileErr := os.OpenFile(skipLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    if fileErr != nil {
+        log.Printf("Error creating skipped file log: %v\n", fileErr)
+        return
+    }
+    defer file.Close()
+
+    logEntry := fmt.Sprintf("Skipped: %s, Error: %v\n", filePath, err)
+    file.WriteString(logEntry)
+
+    if *verbose {
+        log.Printf("Logged skipped file: %s\n", logEntry)
+    }
 }
